@@ -114,7 +114,7 @@ def compute_answer_logp(
             continue
         
         # Get logits at position i-1 predicting token at position i
-        logits_at_pos = logits[0, i - 1, :]
+        logits_at_pos = logits[0, i - 1, :].to(dtype=torch.float32)
         log_probs_at_pos = F.log_softmax(logits_at_pos, dim=-1)
         
         # Target
