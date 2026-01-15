@@ -38,6 +38,9 @@ class EdgePatchConfig:
     
     # Scoring
     score_method: str = "delta_logp"  # "delta_logp" or "abs_delta_logp"
+    score_span: str = "extended"      # "answer_only", "extended", "reasoning_only"
+    score_extend_tokens: int = 20     # Tokens before answer to include when score_span="extended"
+    saturation_threshold: float = 0.999  # Warn if all baseline probs exceed this
     
     # TA labels
     ta_label_field: str = "counterfactual_importance_accuracy"
@@ -165,6 +168,17 @@ def create_arg_parser() -> argparse.ArgumentParser:
     
     # Scoring
     parser.add_argument("--score-method", type=str, choices=["delta_logp", "abs_delta_logp"])
+    parser.add_argument(
+        "--score-span",
+        type=str,
+        choices=["answer_only", "extended", "reasoning_only"],
+        help="What to score: answer_only, extended (answer + N reasoning tokens), reasoning_only"
+    )
+    parser.add_argument(
+        "--score-extend-tokens",
+        type=int,
+        help="Number of reasoning tokens to include when score_span=extended (default: 20)"
+    )
     
     # Output
     parser.add_argument("--output-dir", type=str)

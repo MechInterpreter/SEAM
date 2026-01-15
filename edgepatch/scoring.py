@@ -89,12 +89,18 @@ def compute_answer_logp(
     answer_start_token: int,
     answer_end_token: int,
     tokenizer=None,
-    device=None
-) -> float:
+    device=None,
+    return_probs: bool = False
+):
     """
     Compute log-probability of answer tokens given the context.
     
-    Includes detailed diagnostics to debug baseline logP degeneracy.
+    Args:
+        return_probs: If True, also return list of per-token probabilities for saturation check.
+    
+    Returns:
+        If return_probs=False: float (sum of log-probs)
+        If return_probs=True: tuple (float sum_logp, list[float] probs)
     """
     with torch.no_grad():
         outputs = model(input_ids, use_cache=False)
@@ -102,12 +108,13 @@ def compute_answer_logp(
     
     # For each answer token, get the log-prob from the previous position's prediction
     log_probs = []
+    per_token_probs = []
     
     # Only print diagnostics if tokenizer provided (usually for baseline)
     show_diagnostics = (tokenizer is not None)
     
     if show_diagnostics:
-        print(f"\n[{_ts()}] [DIAGNOSTIC] Scoring Answer Span (tokens {answer_start_token}-{answer_end_token}):", flush=True)
+        print(f"\n[{_ts()}] [DIAGNOSTIC] Scoring Span (tokens {answer_start_token}-{answer_end_token}):", flush=True)
     
     for i in range(answer_start_token, answer_end_token):
         if i == 0:
@@ -122,10 +129,13 @@ def compute_answer_logp(
         log_prob = log_probs_at_pos[target_token_id].item()
         log_probs.append(log_prob)
         
+        # Compute probability for saturation check
+        probs = F.softmax(logits_at_pos, dim=-1)
+        target_prob = probs[target_token_id].item()
+        per_token_probs.append(target_prob)
+        
         # Detailed diagnostics
         if show_diagnostics:
-            probs = F.softmax(logits_at_pos, dim=-1)
-            target_prob = probs[target_token_id].item()
             target_str = tokenizer.decode([target_token_id])
             
             # Rank
@@ -137,13 +147,15 @@ def compute_answer_logp(
             top3_info = []
             for idx in top3_indices:
                 tok_str = tokenizer.decode([idx]).replace('\n', '\\n')
-                prob = probs[idx].item()
-                top3_info.append(f"'{tok_str}' ({prob:.4f})")
+                prob_val = probs[idx].item()
+                top3_info.append(f"'{tok_str}' ({prob_val:.4f})")
             
             print(f"  Pos {i} | Target: {repr(target_str)} (id: {target_token_id}) | "
                   f"LogP: {log_prob:.4f} | Prob: {target_prob:.4f} | Rank: {rank}", flush=True)
             print(f"    Top-3: {', '.join(top3_info)}", flush=True)
-            
+    
+    if return_probs:
+        return sum(log_probs), per_token_probs
     return sum(log_probs)
 
 
@@ -223,18 +235,48 @@ def compute_chunk_scores(
         )
     
     # ================================================================
+    # SCORING SPAN CALCULATION
+    # ================================================================
+    # Determine actual span to score based on config
+    scoring_start = answer_span.start_token
+    scoring_end = answer_span.end_token
+    
+    if config.score_span == "extended":
+        # Extend backwards to include more tokens (less saturated)
+        scoring_start = max(1, answer_span.start_token - config.score_extend_tokens)
+        print(f"[{_ts()}] Extended scoring span: tokens {scoring_start}-{scoring_end} "
+              f"(+{answer_span.start_token - scoring_start} reasoning tokens)", flush=True)
+    elif config.score_span == "reasoning_only":
+        # Score only the tokens before the answer (last chunk of reasoning)
+        scoring_end = answer_span.start_token
+        scoring_start = max(1, scoring_end - config.score_extend_tokens)
+        print(f"[{_ts()}] Reasoning-only span: tokens {scoring_start}-{scoring_end}", flush=True)
+    else:  # answer_only
+        print(f"[{_ts()}] Answer-only span: tokens {scoring_start}-{scoring_end}", flush=True)
+    
+    # ================================================================
     # BASELINE FORWARD PASS
     # ================================================================
     print(f"[{_ts()}] PHASE: Computing baseline logP (1 forward pass)...", flush=True)
     baseline_start = time.time()
     
-    baseline_logp = compute_answer_logp(
-        model, input_ids, answer_span.start_token, answer_span.end_token,
-        tokenizer=tokenizer  # Enable diagnostics for baseline
+    baseline_logp, baseline_probs = compute_answer_logp(
+        model, input_ids, scoring_start, scoring_end,
+        tokenizer=tokenizer,  # Enable diagnostics for baseline
+        return_probs=True     # Also return per-token probs for saturation check
     )
     
     baseline_elapsed = time.time() - baseline_start
     print(f"[{_ts()}] PHASE: Baseline complete ({baseline_elapsed:.2f}s) | logP={baseline_logp:.4f}", flush=True)
+    
+    # Saturation check
+    if baseline_probs and all(p > config.saturation_threshold for p in baseline_probs):
+        print(f"\n[{_ts()}] ⚠️ SATURATION WARNING: All baseline probs > {config.saturation_threshold}", flush=True)
+        print(f"[{_ts()}] ⚠️ Deltas will be uninformative. Consider using --score-span extended", flush=True)
+        print(f"[{_ts()}] ⚠️ Probs: {[f'{p:.4f}' for p in baseline_probs]}", flush=True)
+    else:
+        min_prob = min(baseline_probs) if baseline_probs else 0
+        print(f"[{_ts()}] ✓ Non-saturated target (min prob: {min_prob:.4f})", flush=True)
     
     # ================================================================
     # MASKED FORWARD PASSES (main loop)
@@ -242,7 +284,7 @@ def compute_chunk_scores(
     print(f"\n[{_ts()}] PHASE: Scoring {num_chunks} chunks (masked forward passes)...", flush=True)
     
     scores = []
-    q_positions = list(range(answer_span.start_token, answer_span.end_token))
+    q_positions = list(range(scoring_start, scoring_end))  # Use extended span
     
     # Start heartbeat
     heartbeat = Heartbeat(interval_seconds=30.0, context=f"Scoring example {example.id}")

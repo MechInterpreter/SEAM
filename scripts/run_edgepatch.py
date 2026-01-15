@@ -66,6 +66,17 @@ def main():
         # Set default max_scan_items for confirm
         if not hasattr(args, 'max_scan_items') or getattr(args, 'max_scan_items', None) is None:
             base_config.max_scan_items = 5000
+    elif args.mode == "nuclear":
+        # Nuclear mode: mask ALL layers to prove causal connection
+        if args.max_examples is None:
+            args.max_examples = 1
+        # Force all layers (32 for DeepSeek-R1-Distill-Llama-8B)
+        args.edge_layers = list(range(32))
+        args.edge_heads = None  # ALL heads
+        if not hasattr(args, 'max_scan_items') or getattr(args, 'max_scan_items', None) is None:
+            base_config.max_scan_items = 2000
+        print(f"[{_ts()}] NUCLEAR MODE: Masking ALL 32 layers, ALL heads", flush=True)
+        print(f"[{_ts()}] Expected: Large negative delta (proves causal connection)", flush=True)
     # main mode: max_scan_items stays None (unlimited)
     
     # Override with CLI args
