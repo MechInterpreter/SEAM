@@ -159,6 +159,134 @@ def compute_answer_logp(
     return sum(log_probs)
 
 
+def compute_baseline_distributions(
+    model,
+    input_ids: torch.Tensor,
+    scoring_start: int,
+    scoring_end: int,
+    tokenizer=None,
+) -> tuple[torch.Tensor, float, list[float]]:
+    """
+    Compute baseline log-softmax distributions for the scoring span.
+    
+    Returns:
+        baseline_log_probs: Tensor of shape [span_length, vocab_size] containing
+                           log-softmax of baseline logits for each position.
+        sum_logp: Sum of log-probs for gold tokens (for logging compatibility).
+        per_token_probs: List of probabilities for gold tokens (saturation check).
+    """
+    with torch.no_grad():
+        outputs = model(input_ids, use_cache=False)
+        logits = outputs.logits  # [batch, seq_len, vocab]
+    
+    span_length = scoring_end - scoring_start
+    vocab_size = logits.shape[-1]
+    
+    # Store log-softmax for each position in the scoring span
+    # Position i predicts token at position i+1, so we use logits[i-1] for token i
+    baseline_log_probs = torch.zeros(span_length, vocab_size, dtype=torch.float32)
+    
+    per_token_probs = []
+    log_probs_sum = 0.0
+    
+    show_diagnostics = (tokenizer is not None)
+    if show_diagnostics:
+        print(f"\n[{_ts()}] [DIAGNOSTIC] Baseline distributions (tokens {scoring_start}-{scoring_end}):", flush=True)
+    
+    for idx, pos in enumerate(range(scoring_start, scoring_end)):
+        if pos == 0:
+            continue
+        
+        # Get logits at position pos-1 (predicting token at pos)
+        logits_at_pos = logits[0, pos - 1, :].to(dtype=torch.float32)
+        log_probs_at_pos = F.log_softmax(logits_at_pos, dim=-1)
+        
+        baseline_log_probs[idx] = log_probs_at_pos
+        
+        # Also compute gold token prob for logging/saturation check
+        target_token_id = input_ids[0, pos].item()
+        log_prob = log_probs_at_pos[target_token_id].item()
+        log_probs_sum += log_prob
+        
+        probs = torch.exp(log_probs_at_pos)
+        target_prob = probs[target_token_id].item()
+        per_token_probs.append(target_prob)
+        
+        if show_diagnostics and idx < 5:  # Only first 5 for brevity
+            target_str = tokenizer.decode([target_token_id])
+            print(f"  Pos {pos} | Token: {repr(target_str)} | LogP: {log_prob:.4f} | Prob: {target_prob:.4f}", flush=True)
+    
+    if show_diagnostics:
+        print(f"  ... (stored {span_length} position distributions, vocab_size={vocab_size})", flush=True)
+    
+    return baseline_log_probs, log_probs_sum, per_token_probs
+
+
+def compute_kl_divergence(
+    model,
+    input_ids: torch.Tensor,
+    scoring_start: int,
+    scoring_end: int,
+    baseline_log_probs: torch.Tensor,
+    tokenizer=None,
+) -> tuple[float, float]:
+    """
+    Compute KL(p_base || p_masked) for the scoring span.
+    
+    KL(p || q) = sum_i p_i * (log p_i - log q_i)
+    
+    Args:
+        baseline_log_probs: Tensor [span_length, vocab_size] of log-softmax from baseline.
+        
+    Returns:
+        kl_sum: Sum of KL divergence over all positions in the span.
+        masked_logp_sum: Sum of log-probs for gold tokens (for logging).
+    """
+    with torch.no_grad():
+        outputs = model(input_ids, use_cache=False)
+        logits = outputs.logits  # [batch, seq_len, vocab]
+    
+    span_length = scoring_end - scoring_start
+    kl_total = 0.0
+    masked_logp_sum = 0.0
+    
+    show_diagnostics = (tokenizer is not None)
+    if show_diagnostics:
+        print(f"\n[{_ts()}] [DIAGNOSTIC] KL divergence computation:", flush=True)
+    
+    for idx, pos in enumerate(range(scoring_start, scoring_end)):
+        if pos == 0:
+            continue
+        
+        # Get masked logits at position pos-1
+        logits_at_pos = logits[0, pos - 1, :].to(dtype=torch.float32)
+        masked_log_probs = F.log_softmax(logits_at_pos, dim=-1)
+        
+        # Get baseline log-probs for this position
+        base_log_probs = baseline_log_probs[idx].to(logits.device)
+        
+        # Compute KL(p_base || p_masked) = sum(p_base * (log_p_base - log_p_masked))
+        # p_base = exp(base_log_probs)
+        p_base = torch.exp(base_log_probs)
+        kl_pos = torch.sum(p_base * (base_log_probs - masked_log_probs)).item()
+        
+        # Clamp tiny negatives from fp error
+        kl_pos = max(0.0, kl_pos)
+        kl_total += kl_pos
+        
+        # Also track gold token log-prob for logging
+        target_token_id = input_ids[0, pos].item()
+        masked_logp_sum += masked_log_probs[target_token_id].item()
+        
+        if show_diagnostics and idx < 3:
+            print(f"  Pos {pos} | KL: {kl_pos:.4f}", flush=True)
+    
+    if show_diagnostics:
+        print(f"  Total KL over span: {kl_total:.4f}", flush=True)
+    
+    return kl_total, masked_logp_sum
+
+
 def compute_chunk_scores(
     model,
     tokenizer,
@@ -256,24 +384,25 @@ def compute_chunk_scores(
         print(f"[{_ts()}] Answer-only span: tokens {scoring_start}-{scoring_end}", flush=True)
     
     # ================================================================
-    # BASELINE FORWARD PASS
+    # BASELINE FORWARD PASS (store distributions for KL)
     # ================================================================
-    print(f"[{_ts()}] PHASE: Computing baseline logP (1 forward pass)...", flush=True)
+    print(f"[{_ts()}] PHASE: Computing baseline distributions (1 forward pass)...", flush=True)
+    print(f"[{_ts()}] Scoring metric: KL(p_base || p_masked) over span tokens {scoring_start}-{scoring_end}", flush=True)
     baseline_start = time.time()
     
-    baseline_logp, baseline_probs = compute_answer_logp(
+    baseline_log_probs, baseline_logp, baseline_probs = compute_baseline_distributions(
         model, input_ids, scoring_start, scoring_end,
         tokenizer=tokenizer,  # Enable diagnostics for baseline
-        return_probs=True     # Also return per-token probs for saturation check
     )
     
     baseline_elapsed = time.time() - baseline_start
-    print(f"[{_ts()}] PHASE: Baseline complete ({baseline_elapsed:.2f}s) | logP={baseline_logp:.4f}", flush=True)
+    span_length = scoring_end - scoring_start
+    print(f"[{_ts()}] PHASE: Baseline complete ({baseline_elapsed:.2f}s) | span_length={span_length} | gold_logP={baseline_logp:.4f}", flush=True)
     
     # Saturation check
     if baseline_probs and all(p > config.saturation_threshold for p in baseline_probs):
         print(f"\n[{_ts()}] ⚠️ SATURATION WARNING: All baseline probs > {config.saturation_threshold}", flush=True)
-        print(f"[{_ts()}] ⚠️ Deltas will be uninformative. Consider using --score-span extended", flush=True)
+        print(f"[{_ts()}] ⚠️ KL values may be small. Consider using --score-span extended", flush=True)
         print(f"[{_ts()}] ⚠️ Probs: {[f'{p:.4f}' for p in baseline_probs]}", flush=True)
     else:
         min_prob = min(baseline_probs) if baseline_probs else 0
@@ -321,33 +450,35 @@ def compute_chunk_scores(
             ) as masker:
                 masker.set_mask_positions(q_positions, k_positions)
                 
-                # Compute masked log-probability (use same span as baseline!)
-                # For chunk 0, enable diagnostics to debug the masked=0.0 issue
-                masked_logp = compute_answer_logp(
+                # Compute KL divergence: KL(p_base || p_masked)
+                # Higher KL = more important chunk (masking changed distribution more)
+                kl_score, masked_logp = compute_kl_divergence(
                     model, input_ids, scoring_start, scoring_end,
+                    baseline_log_probs,
                     tokenizer=tokenizer if chunk_idx == 0 else None  # Diagnostics for first chunk
                 )
                 
                 # Get instrumentation
                 stats = masker.stats
             
-            delta = masked_logp - baseline_logp
             chunk_elapsed = time.time() - chunk_start
             
             # Detailed log for first chunk
             if chunk_idx == 0 and config.probe_chunk_0:
-                print(f"[{_ts()}] [PROBE] Chunk 0: baseline={baseline_logp:.4f}, masked={masked_logp:.4f}, delta={delta:.4f}", flush=True)
+                print(f"[{_ts()}] [PROBE] Chunk 0: KL={kl_score:.4f}, masked_logP={masked_logp:.4f}", flush=True)
                 print(f"[{_ts()}] [PROBE] layers_mask_applied={sorted(stats.layers_mask_applied)}", flush=True)
                 print(f"[{_ts()}] [PROBE] heads_mask_applied={stats.heads_mask_applied}", flush=True)
                 print(f"[{_ts()}] [PROBE] masked_entries_count={stats.masked_entries_count}", flush=True)
             
             # Progress summary every chunk
-            print(f"[{_ts()}] Chunk {chunk_idx + 1}/{num_chunks} complete ({chunk_elapsed:.2f}s) | delta={delta:.4f}", flush=True)
+            print(f"[{_ts()}] Chunk {chunk_idx + 1}/{num_chunks} complete ({chunk_elapsed:.2f}s) | KL={kl_score:.4f}", flush=True)
             
+            # Store KL score in delta_logp field for artifact compatibility
+            # Higher KL = more important (no negation needed unlike delta_logp)
             scores.append(ChunkScore(
                 chunk_idx=chunk_idx,
-                delta_logp=delta,
-                abs_delta_logp=abs(delta),
+                delta_logp=kl_score,  # Now stores KL divergence
+                abs_delta_logp=kl_score,  # KL is always non-negative
                 baseline_logp=baseline_logp,
                 masked_logp=masked_logp,
                 ta_label=example.chunks[chunk_idx].ta_label,
@@ -373,11 +504,14 @@ def get_scores_array(
     chunk_scores: list[ChunkScore],
     score_method: str = "delta_logp",
 ) -> list[float]:
-    """Extract scores array from ChunkScore list."""
+    """Extract scores array from ChunkScore list.
+    
+    Note: delta_logp field now stores KL divergence.
+    Higher KL = chunk more important (masking changed distribution more).
+    """
     if score_method == "delta_logp":
-        # More negative = more important (blocking hurt more)
-        # Negate so higher = more important for correlation
-        return [-s.delta_logp for s in chunk_scores]
+        # KL divergence: higher = more important (no negation needed)
+        return [s.delta_logp for s in chunk_scores]
     elif score_method == "abs_delta_logp":
         return [s.abs_delta_logp for s in chunk_scores]
     else:
