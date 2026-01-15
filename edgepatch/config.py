@@ -58,6 +58,13 @@ class EdgePatchConfig:
     verbose: bool = True
     probe_chunk_0: bool = True  # Print detailed info for first chunk
     
+    # Rollout-light scoring method
+    method: str = "legacy"        # "legacy" (KL only) or "rollout_light" (decision points + rollouts)
+    rollout_k: int = 8            # Number of rollouts per decision point
+    rollout_h: int = 128          # Horizon (tokens) per rollout
+    max_decision_points: int = 8  # Max decision points to evaluate per example
+    rollout_temperature: float = 0.7  # Sampling temperature for rollouts
+    
     def to_dict(self) -> dict:
         """Convert config to dictionary."""
         return asdict(self)
@@ -203,6 +210,17 @@ def create_arg_parser() -> argparse.ArgumentParser:
         type=str,
         help="Path to Drive directory for incremental sync after each example (e.g., /content/drive/MyDrive/SEAM/runs/my_run)"
     )
+    
+    # Rollout-light scoring method
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["legacy", "rollout_light"],
+        help="Scoring method: legacy (KL only) or rollout_light (decision points + rollouts)"
+    )
+    parser.add_argument("--rollout-k", type=int, help="Number of rollouts per decision point (default: 8)")
+    parser.add_argument("--rollout-h", type=int, help="Horizon (tokens) per rollout (default: 128)")
+    parser.add_argument("--max-decision-points", type=int, help="Max decision points to evaluate (default: 8)")
     
     return parser
 

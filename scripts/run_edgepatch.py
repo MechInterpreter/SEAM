@@ -27,7 +27,7 @@ from edgepatch.config import EdgePatchConfig, create_arg_parser
 from edgepatch.data import load_dataset_examples, Example
 from edgepatch.spans import align_chunks_to_tokens, validate_spans, AlignmentError
 from edgepatch.model import load_model_and_tokenizer
-from edgepatch.scoring import compute_chunk_scores, ChunkScore
+from edgepatch.scoring import compute_chunk_scores, compute_chunk_scores_rollout_light, ChunkScore
 from edgepatch.eval import compute_metrics, print_metrics_summary
 from edgepatch.utils import setup_logging, get_run_dir, RunArtifacts
 
@@ -197,16 +197,42 @@ def main():
                            f"{len(chunk_spans)} chunk spans, "
                            f"{answer_span.length} answer tokens")
                 
-                # Compute chunk scores
-                chunk_scores = compute_chunk_scores(
-                    model,
-                    tokenizer,
-                    example,
-                    chunk_spans,
-                    answer_span,
-                    model_info,
-                    config,
+                # Method routing: choose scoring method
+                # smoke/nuclear: always use legacy for sanity checks
+                # confirm/main: use rollout_light by default (unless --method legacy set)
+                use_rollout_light = (
+                    config.method == "rollout_light" or 
+                    (config.method != "legacy" and args.mode in ["confirm", "main"])
                 )
+                
+                # Force legacy for smoke/nuclear modes
+                if args.mode in ["smoke", "nuclear"]:
+                    use_rollout_light = False
+                
+                method_details = None
+                
+                if use_rollout_light:
+                    print(f"[{_ts()}] Using rollout_light scoring method", flush=True)
+                    chunk_scores, method_details = compute_chunk_scores_rollout_light(
+                        model,
+                        tokenizer,
+                        example,
+                        chunk_spans,
+                        answer_span,
+                        model_info,
+                        config,
+                    )
+                else:
+                    print(f"[{_ts()}] Using legacy (KL) scoring method", flush=True)
+                    chunk_scores = compute_chunk_scores(
+                        model,
+                        tokenizer,
+                        example,
+                        chunk_spans,
+                        answer_span,
+                        model_info,
+                        config,
+                    )
                 
                 # Store results
                 all_scores.append(chunk_scores)
@@ -215,8 +241,14 @@ def main():
                     "example_id": example.id,
                     "n_chunks": example.num_chunks,
                     "n_tokens": encoding_info["n_tokens"],
+                    "method": "rollout_light" if use_rollout_light else "legacy",
                     "scores": [asdict(s) for s in chunk_scores],
                 }
+                
+                # Add method details if available
+                if method_details:
+                    result["method_details"] = method_details
+                
                 all_results.append(result)
                 
                 # Incremental sync to Drive (if configured)

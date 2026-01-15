@@ -521,3 +521,221 @@ def get_scores_array(
 def get_ta_labels_array(chunk_scores: list[ChunkScore]) -> list[float]:
     """Extract TA labels array from ChunkScore list."""
     return [s.ta_label for s in chunk_scores]
+
+
+def compute_chunk_scores_rollout_light(
+    model,
+    tokenizer,
+    example: Example,
+    chunk_spans: list[TokenSpan],
+    answer_span: TokenSpan,
+    model_info: dict,
+    config: EdgePatchConfig,
+) -> tuple[list[ChunkScore], dict]:
+    """
+    Compute chunk importance using rollout-light v2 method.
+    
+    Phases:
+    1. Discover decision points via entropy/margin curves
+    2. Screen chunks by attention weights (FREE - no forward passes)
+    3. Receiver-side masking for top-L chunks per decision point
+    4. Optional: Paired rollouts at top decision points
+    
+    Returns:
+        chunk_scores: List of ChunkScore objects (same schema as legacy)
+        method_details: Dict with decision points, rollout results, etc.
+    """
+    from edgepatch.decision_points import (
+        discover_decision_points, 
+        screen_chunks_by_attention,
+    )
+    from edgepatch.rollout import (
+        run_screening_with_receiver_masking,
+        run_paired_rollouts,
+    )
+    
+    device = next(model.parameters()).device
+    num_chunks = len(chunk_spans)
+    
+    print(f"\n[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}] ROLLOUT-LIGHT SCORING", flush=True)
+    print(f"[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}]   Chunks: {num_chunks}", flush=True)
+    print(f"[{_ts()}]   Max decision points: {config.max_decision_points}", flush=True)
+    print(f"[{_ts()}]   Rollout K/H: {config.rollout_k}/{config.rollout_h}", flush=True)
+    print(f"[{_ts()}] {'='*60}\n", flush=True)
+    
+    # ================================================================
+    # PHASE 1: TOKENIZATION
+    # ================================================================
+    print(f"[{_ts()}] PHASE 1: Tokenization...", flush=True)
+    encoding = tokenizer(
+        example.full_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=config.max_seq_len,
+    )
+    input_ids = encoding["input_ids"].to(device)
+    seq_len = input_ids.shape[1]
+    print(f"[{_ts()}] PHASE 1: Complete | seq_len={seq_len}", flush=True)
+    
+    # ================================================================
+    # PHASE 2: DECISION POINT DISCOVERY (1 forward pass with attention)
+    # ================================================================
+    print(f"\n[{_ts()}] PHASE 2: Decision point discovery...", flush=True)
+    phase2_start = time.time()
+    
+    decision_points, entropy_curve, attention_weights = discover_decision_points(
+        model, input_ids, tokenizer,
+        max_points=config.max_decision_points,
+        return_attention=True,
+    )
+    
+    phase2_elapsed = time.time() - phase2_start
+    print(f"[{_ts()}] PHASE 2: Complete ({phase2_elapsed:.2f}s) | {len(decision_points)} decision points", flush=True)
+    
+    # ================================================================
+    # PHASE 3: ATTENTION-BASED SCREENING (FREE - no forward passes)
+    # ================================================================
+    print(f"\n[{_ts()}] PHASE 3: Attention-based chunk screening...", flush=True)
+    top_l = min(15, num_chunks)
+    
+    screen_chunks_by_attention(decision_points, attention_weights, chunk_spans, top_l=top_l)
+    
+    print(f"[{_ts()}] PHASE 3: Complete | top-{top_l} chunks per decision point", flush=True)
+    
+    # ================================================================
+    # PHASE 4: RECEIVER-SIDE MASKING SCREENING
+    # ================================================================
+    print(f"\n[{_ts()}] PHASE 4: Receiver-side masking screening...", flush=True)
+    phase4_start = time.time()
+    
+    # Compute baseline distributions for screening
+    with torch.no_grad():
+        outputs = model(input_ids, use_cache=False)
+        baseline_logits = outputs.logits[0]  # [seq_len, vocab]
+        baseline_log_probs = F.log_softmax(baseline_logits.float(), dim=-1)
+    
+    # Initialize per-chunk scores
+    chunk_kl_totals = {i: 0.0 for i in range(num_chunks)}
+    chunk_hit_counts = {i: 0 for i in range(num_chunks)}
+    
+    for dp in decision_points:
+        # Screen chunks at this decision point
+        chunk_kl_scores = run_screening_with_receiver_masking(
+            model, input_ids, dp, chunk_spans, baseline_log_probs, config
+        )
+        
+        for chunk_idx, kl in chunk_kl_scores:
+            chunk_kl_totals[chunk_idx] += kl
+            chunk_hit_counts[chunk_idx] += 1
+        
+        # Update decision point with top chunks by KL
+        dp.top_chunks = [c for c, _ in chunk_kl_scores[:3]]  # Top-3 for rollouts
+    
+    phase4_elapsed = time.time() - phase4_start
+    total_screenings = sum(chunk_hit_counts.values())
+    print(f"[{_ts()}] PHASE 4: Complete ({phase4_elapsed:.2f}s) | {total_screenings} (chunk, dp) evaluations", flush=True)
+    
+    # ================================================================
+    # PHASE 5: OPTIONAL ROLLOUTS (if enabled and compute budget allows)
+    # ================================================================
+    rollout_results = []
+    
+    if config.rollout_k > 0 and config.rollout_h > 0 and len(decision_points) > 0:
+        print(f"\n[{_ts()}] PHASE 5: Paired rollouts at decision points...", flush=True)
+        phase5_start = time.time()
+        
+        # Rollouts only at top M decision points, for top T chunks
+        rollout_budget = 0
+        for dp in decision_points[:3]:  # Top 3 decision points
+            for chunk_idx in dp.top_chunks[:3]:  # Top 3 chunks per dp
+                if chunk_idx >= len(chunk_spans):
+                    continue
+                    
+                chunk_span = chunk_spans[chunk_idx]
+                
+                result = run_paired_rollouts(
+                    model, tokenizer, input_ids,
+                    decision_point_token_idx=dp.token_idx,
+                    chunk_span_start=chunk_span.start_token,
+                    chunk_span_end=chunk_span.end_token,
+                    chunk_idx=chunk_idx,
+                    rollout_k=config.rollout_k,
+                    rollout_h=config.rollout_h,
+                    temperature=config.rollout_temperature,
+                )
+                
+                rollout_results.append(result)
+                rollout_budget += config.rollout_k * 2
+                
+                # Log result
+                print(f"[{_ts()}]   dp={dp.token_idx}, chunk={chunk_idx}: "
+                      f"ans_shift={result.answer_prob_shift:.3f}, "
+                      f"content_div={result.answer_content_divergence:.3f}", flush=True)
+        
+        phase5_elapsed = time.time() - phase5_start
+        print(f"[{_ts()}] PHASE 5: Complete ({phase5_elapsed:.2f}s) | {len(rollout_results)} rollout sets", flush=True)
+    else:
+        print(f"\n[{_ts()}] PHASE 5: Skipped (rollouts disabled)", flush=True)
+    
+    # ================================================================
+    # PHASE 6: AGGREGATE SCORES
+    # ================================================================
+    print(f"\n[{_ts()}] PHASE 6: Aggregating chunk scores...", flush=True)
+    
+    # Incorporate rollout divergence into chunk scores
+    rollout_boosts = {i: 0.0 for i in range(num_chunks)}
+    for result in rollout_results:
+        # Higher answer_prob_shift or content_divergence = more important
+        boost = result.answer_prob_shift + result.answer_content_divergence
+        rollout_boosts[result.chunk_idx] += boost
+    
+    # Create ChunkScore objects
+    scores = []
+    for chunk_idx in range(num_chunks):
+        # Base score: average KL across decision points where this chunk was evaluated
+        if chunk_hit_counts[chunk_idx] > 0:
+            kl_score = chunk_kl_totals[chunk_idx] / chunk_hit_counts[chunk_idx]
+        else:
+            kl_score = 0.0
+        
+        # Add rollout boost
+        final_score = kl_score + rollout_boosts[chunk_idx]
+        
+        scores.append(ChunkScore(
+            chunk_idx=chunk_idx,
+            delta_logp=final_score,  # Using delta_logp field for compatibility
+            abs_delta_logp=final_score,
+            baseline_logp=0.0,  # Not applicable for rollout-light
+            masked_logp=0.0,
+            ta_label=example.chunks[chunk_idx].ta_label,
+            layers_mask_applied=[],
+            heads_mask_applied={},
+            masked_entries_count=0,
+        ))
+    
+    print(f"[{_ts()}] PHASE 6: Complete | {len(scores)} chunk scores", flush=True)
+    
+    # Build method details for artifact
+    method_details = {
+        "method": "rollout_light",
+        "decision_points": [dp.to_dict() for dp in decision_points],
+        "rollout_results": [r.to_dict() for r in rollout_results],
+        "config": {
+            "max_decision_points": config.max_decision_points,
+            "rollout_k": config.rollout_k,
+            "rollout_h": config.rollout_h,
+            "top_l_screening": top_l,
+        },
+        "stats": {
+            "decision_points_found": len(decision_points),
+            "chunks_screened": total_screenings,
+            "rollout_sets": len(rollout_results),
+        }
+    }
+    
+    print(f"\n[{_ts()}] ROLLOUT-LIGHT SCORING COMPLETE", flush=True)
+    
+    return scores, method_details
+
