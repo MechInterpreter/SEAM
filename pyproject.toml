@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edgepatch-min"
+version = "0.1.0"
+description = "Minimal Edge-Patch / Causal Receiver Masking implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "MechInterpreter"}
+]
+dependencies = [
+    "transformers==4.57.3",
+    "torch>=2.0.0",
+    "datasets>=2.14.0",
+    "bitsandbytes>=0.41.0",
+    "accelerate>=0.24.0",
+    "scipy>=1.11.0",
+    "scikit-learn>=1.3.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["edgepatch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

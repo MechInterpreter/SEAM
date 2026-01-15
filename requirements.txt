@@ -1,0 +1,15 @@
+# EdgePatch-Min Requirements
+# Pinned for reproducibility - tested on Colab A100
+
+transformers==4.57.3
+torch>=2.0.0
+datasets>=2.14.0
+bitsandbytes>=0.41.0
+accelerate>=0.24.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+pyyaml>=6.0
+
+# Dev dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
