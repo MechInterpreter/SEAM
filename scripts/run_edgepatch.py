@@ -52,9 +52,16 @@ def main():
     if args.mode == "smoke":
         if args.max_examples is None:
             args.max_examples = 1
+        # Set default max_scan_items for smoke
+        if not hasattr(args, 'max_scan_items') or getattr(args, 'max_scan_items', None) is None:
+            base_config.max_scan_items = 2000
     elif args.mode == "confirm":
         if args.max_examples is None:
             args.max_examples = 3
+        # Set default max_scan_items for confirm
+        if not hasattr(args, 'max_scan_items') or getattr(args, 'max_scan_items', None) is None:
+            base_config.max_scan_items = 5000
+    # main mode: max_scan_items stays None (unlimited)
     
     # Override with CLI args
     config = EdgePatchConfig.from_args(args, base_config)
@@ -71,13 +78,21 @@ def main():
     print(f"[{_ts()}] Output: {run_dir}", flush=True)
     print(f"[{_ts()}] {'='*60}", flush=True)
     
+    # Streaming/filtering settings
+    print(f"[{_ts()}] Dataset Settings:", flush=True)
+    print(f"[{_ts()}]   Streaming: {config.dataset_streaming}", flush=True)
+    print(f"[{_ts()}]   TA-labeled only: {config.ta_labeled_only} (field: {config.ta_label_field})", flush=True)
+    print(f"[{_ts()}]   Allowlist: {len(config.example_id_allowlist or [])} IDs", flush=True)
+    print(f"[{_ts()}]   Max examples: {config.max_examples}", flush=True)
+    print(f"[{_ts()}]   Max scan items: {config.max_scan_items or 'unlimited'}", flush=True)
+    
+    # Edge masking config (CRITICAL)
+    print(f"[{_ts()}] Edge Masking:", flush=True)
+    print(f"[{_ts()}]   Layers: {config.edge_layers or 'ALL'}", flush=True)
+    print(f"[{_ts()}]   Heads: {config.edge_heads or 'ALL'}", flush=True)
+    
     # Save config
     artifacts.save_config(config.to_dict())
-    
-    # Log edge masking config (CRITICAL)
-    print(f"[{_ts()}] Edge layers: {config.edge_layers or 'ALL'}", flush=True)
-    print(f"[{_ts()}] Edge heads: {config.edge_heads or 'ALL'}", flush=True)
-    print(f"[{_ts()}] Max examples: {config.max_examples}", flush=True)
     
     start_time = time.time()
     

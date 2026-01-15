@@ -3,6 +3,8 @@ Dataset loading and chunk extraction for EdgePatch.
 
 Loads the uzaymacar/math-rollouts dataset and extracts chunks with their
 TA (Thought Anchors) labels, using the dataset's original chunk boundaries.
+
+Supports streaming mode to avoid full dataset materialization.
 """
 
 from dataclasses import dataclass
@@ -11,8 +13,9 @@ import json
 import logging
 import time
 import os
+from datetime import datetime
 
-from datasets import load_dataset
+from datasets import load_dataset, IterableDataset
 
 from edgepatch.config import EdgePatchConfig
 
@@ -22,16 +25,32 @@ logger = logging.getLogger("edgepatch")
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 2
 MAX_BACKOFF_SECONDS = 60
-HF_TIMEOUT_SECONDS = 120  # Increased timeout
+HF_TIMEOUT_SECONDS = 120
 
 
-def _load_dataset_with_retry(dataset_name: str, split: str) -> any:
+def _ts() -> str:
+    """Return current timestamp string for logging."""
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _load_dataset_streaming(
+    dataset_name: str,
+    split: str,
+    streaming: bool = True,
+    max_examples: int = 10,
+) -> any:
     """
-    Load a HuggingFace dataset with retry logic and exponential backoff.
+    Load a HuggingFace dataset with retry logic and optional streaming.
     
-    Handles transient network errors like ReadTimeout.
+    Args:
+        dataset_name: HuggingFace dataset name
+        split: Dataset split (e.g., "train")
+        streaming: If True, use streaming mode to avoid full materialization
+        max_examples: Used for fallback slice sizing
+    
+    Returns:
+        IterableDataset (streaming) or Dataset (materialized)
     """
-    # Set longer timeout for HuggingFace hub
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(HF_TIMEOUT_SECONDS))
     
     last_error = None
@@ -39,13 +58,35 @@ def _load_dataset_with_retry(dataset_name: str, split: str) -> any:
     
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            logger.info(f"Loading dataset (attempt {attempt}/{MAX_RETRIES})...")
-            ds = load_dataset(dataset_name, split=split)
-            logger.info(f"Dataset loaded successfully on attempt {attempt}")
+            print(f"[{_ts()}] Loading dataset (attempt {attempt}/{MAX_RETRIES}, streaming={streaming})...", flush=True)
+            ds = load_dataset(dataset_name, split=split, streaming=streaming)
+            
+            # Log dataset type for verification
+            is_iterable = isinstance(ds, IterableDataset)
+            print(f"[{_ts()}] Dataset type: {'IterableDataset (streaming)' if is_iterable else 'Dataset (materialized)'}", flush=True)
+            
             return ds
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
+            
+            # Check if streaming not supported - fall back to slicing
+            if streaming and ("streaming" in error_str or "iterable" in error_str):
+                print(f"[{_ts()}] ⚠️ Streaming not supported, trying slice mode...", flush=True)
+                try:
+                    # Compute slice size: min(max(100, max_examples*200), 5000)
+                    slice_size = min(max(100, max_examples * 200), 5000)
+                    slice_split = f"{split}[:{slice_size}]"
+                    print(f"[{_ts()}] Trying slice: {slice_split}", flush=True)
+                    ds = load_dataset(dataset_name, split=slice_split)
+                    print(f"[{_ts()}] Slice mode successful", flush=True)
+                    return ds
+                except Exception as e2:
+                    print(f"[{_ts()}] ⚠️ Slice mode failed: {e2}", flush=True)
+                    # Last resort: full materialize
+                    print(f"[{_ts()}] ⚠️ Falling back to FULL MATERIALIZATION (this will be slow)", flush=True)
+                    ds = load_dataset(dataset_name, split=split)
+                    return ds
             
             # Check if this is a retryable error
             is_retryable = any(err in error_str for err in [
@@ -54,18 +95,19 @@ def _load_dataset_with_retry(dataset_name: str, split: str) -> any:
             ])
             
             if not is_retryable:
-                logger.error(f"Non-retryable error: {e}")
+                print(f"[{_ts()}] Non-retryable error: {e}", flush=True)
                 raise
             
             if attempt < MAX_RETRIES:
-                logger.warning(
-                    f"Attempt {attempt} failed: {type(e).__name__}: {str(e)[:100]}... "
-                    f"Retrying in {backoff}s..."
+                print(
+                    f"[{_ts()}] Attempt {attempt} failed: {type(e).__name__}: {str(e)[:100]}... "
+                    f"Retrying in {backoff}s...",
+                    flush=True
                 )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
             else:
-                logger.error(f"All {MAX_RETRIES} attempts failed")
+                print(f"[{_ts()}] All {MAX_RETRIES} attempts failed", flush=True)
     
     raise RuntimeError(
         f"Failed to load dataset after {MAX_RETRIES} attempts. "
@@ -98,36 +140,151 @@ class Example:
         return len(self.chunks)
 
 
+def _has_ta_labels(item: dict, ta_label_field: str) -> bool:
+    """
+    Check if an item has TA labels based on the configured ta_label_field.
+    
+    The TA labels are stored per-chunk in chunks_labeled, so we check if:
+    1. chunks_labeled exists and is parseable
+    2. At least one chunk has a non-null value for ta_label_field
+    """
+    chunks_labeled_raw = item.get("chunks_labeled")
+    if not chunks_labeled_raw:
+        return False
+    
+    # Parse if string
+    if isinstance(chunks_labeled_raw, str):
+        try:
+            chunks_labeled = json.loads(chunks_labeled_raw)
+        except json.JSONDecodeError:
+            return False
+    else:
+        chunks_labeled = chunks_labeled_raw
+    
+    if not chunks_labeled or not isinstance(chunks_labeled, list):
+        return False
+    
+    # Check if at least one chunk has the ta_label_field with a non-null value
+    for chunk in chunks_labeled:
+        label_value = chunk.get(ta_label_field)
+        if label_value is not None:
+            return True
+    
+    return False
+
+
 def load_dataset_examples(config: EdgePatchConfig) -> Iterator[Example]:
     """
-    Load examples from the HF dataset.
+    Stream examples from the HF dataset with early-stopping and filtering.
+    
+    Features:
+    - Uses streaming mode by default (no full materialization)
+    - Stops after max_examples
+    - Stops after max_scan_items (if set) even if max_examples not reached
+    - Filters to TA-labeled examples (if ta_labeled_only=True)
+    - Filters to allowlist (if example_id_allowlist is set)
     
     Yields Example objects with:
     - full_text: concatenated problem + reasoning_trace + answer
-    - chunks: list of Chunk objects from chunks_labeled.json
+    - chunks: list of Chunk objects from chunks_labeled
     - answer_text/answer_start_char/answer_end_char: answer span info
-    
-    Uses the dataset's original chunk boundaries (NO re-splitting).
     """
-    logger.info(f"Loading dataset: {config.dataset_name} (split: {config.dataset_split})")
+    # Log configuration
+    print(f"\n[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}] DATASET LOADING", flush=True)
+    print(f"[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}]   Dataset: {config.dataset_name}", flush=True)
+    print(f"[{_ts()}]   Streaming: {config.dataset_streaming}", flush=True)
+    print(f"[{_ts()}]   TA-labeled only: {config.ta_labeled_only} (field: {config.ta_label_field})", flush=True)
+    print(f"[{_ts()}]   Allowlist: {len(config.example_id_allowlist or [])} IDs", flush=True)
+    print(f"[{_ts()}]   Max examples: {config.max_examples}", flush=True)
+    print(f"[{_ts()}]   Max scan items: {config.max_scan_items or 'unlimited'}", flush=True)
     
-    ds = _load_dataset_with_retry(config.dataset_name, config.dataset_split)
+    # Build allowlist set for O(1) lookup
+    allowlist = set(config.example_id_allowlist) if config.example_id_allowlist else None
     
-    count = 0
+    # Determine streaming mode
+    use_streaming = config.dataset_streaming and not config.force_materialize_dataset
+    
+    # Load dataset
+    start_time = time.time()
+    ds = _load_dataset_streaming(
+        config.dataset_name,
+        config.dataset_split,
+        streaming=use_streaming,
+        max_examples=config.max_examples,
+    )
+    
+    # Track statistics
+    scanned_count = 0
+    yielded_count = 0
+    skipped_not_in_allowlist = 0
+    skipped_unlabeled = 0
+    skipped_parse_error = 0
+    
+    print(f"[{_ts()}] Scanning for examples...", flush=True)
+    
     for item in ds:
-        if count >= config.max_examples:
+        scanned_count += 1
+        
+        # Check max_scan_items limit
+        if config.max_scan_items is not None and scanned_count > config.max_scan_items:
+            print(f"\n[{_ts()}] ❌ ERROR: Reached max_scan_items={config.max_scan_items} "
+                  f"but only found {yielded_count}/{config.max_examples} examples!", flush=True)
+            print(f"[{_ts()}] This indicates the dataset may not have enough TA-labeled examples "
+                  f"in the first {config.max_scan_items} items.", flush=True)
+            print(f"[{_ts()}] Solutions:", flush=True)
+            print(f"[{_ts()}]   1. Increase --max-scan-items", flush=True)
+            print(f"[{_ts()}]   2. Use --include-unlabeled to skip TA filtering", flush=True)
+            print(f"[{_ts()}]   3. Decrease --max-examples", flush=True)
+            raise RuntimeError(
+                f"Scan limit reached: scanned {scanned_count} items but only found "
+                f"{yielded_count}/{config.max_examples} matching examples"
+            )
+        
+        # Early stop if we have enough examples
+        if yielded_count >= config.max_examples:
+            print(f"[{_ts()}] Reached max_examples={config.max_examples}, stopping early", flush=True)
             break
         
+        # Allowlist filter
+        example_id = item.get("id", str(hash(str(item))))
+        if allowlist and example_id not in allowlist:
+            skipped_not_in_allowlist += 1
+            continue
+        
+        # TA label filter - check if chunks have the configured ta_label_field
+        if config.ta_labeled_only:
+            if not _has_ta_labels(item, config.ta_label_field):
+                skipped_unlabeled += 1
+                continue
+        
+        # Parse the example
         try:
             example = _parse_example(item, config.ta_label_field)
             if example is not None:
                 yield example
-                count += 1
+                yielded_count += 1
+                if yielded_count % 5 == 0 or yielded_count == 1:
+                    print(f"[{_ts()}] Yielded {yielded_count}/{config.max_examples} examples (scanned {scanned_count})...", flush=True)
         except Exception as e:
-            logger.warning(f"Failed to parse example {item.get('id', 'unknown')}: {e}")
+            skipped_parse_error += 1
+            logger.warning(f"Failed to parse example {example_id}: {e}")
             continue
     
-    logger.info(f"Loaded {count} examples")
+    elapsed = time.time() - start_time
+    
+    # Summary
+    print(f"\n[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}] DATASET LOADING SUMMARY", flush=True)
+    print(f"[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}]   Scanned: {scanned_count}", flush=True)
+    print(f"[{_ts()}]   Yielded: {yielded_count}", flush=True)
+    print(f"[{_ts()}]   Skipped (not in allowlist): {skipped_not_in_allowlist}", flush=True)
+    print(f"[{_ts()}]   Skipped (unlabeled): {skipped_unlabeled}", flush=True)
+    print(f"[{_ts()}]   Skipped (parse error): {skipped_parse_error}", flush=True)
+    print(f"[{_ts()}]   Time: {elapsed:.1f}s", flush=True)
+    print(f"[{_ts()}] {'='*60}", flush=True)
 
 
 def _parse_example(item: dict, ta_label_field: str) -> Example | None:
@@ -161,7 +318,7 @@ def _parse_example(item: dict, ta_label_field: str) -> Example | None:
     answer_start_char = len(problem) + len(reasoning_trace)
     answer_end_char = len(full_text)
     
-    # Parse chunks from chunks_labeled.json
+    # Parse chunks from chunks_labeled
     chunks_labeled_raw = item.get("chunks_labeled", None)
     if chunks_labeled_raw is None:
         logger.debug(f"Skipping {example_id}: no chunks_labeled")

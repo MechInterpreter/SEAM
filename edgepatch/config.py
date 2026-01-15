@@ -18,6 +18,13 @@ class EdgePatchConfig:
     dataset_split: str = "train"
     max_examples: int = 10
     
+    # Streaming & filtering (NEW)
+    dataset_streaming: bool = True           # Use streaming=True to avoid full materialization
+    force_materialize_dataset: bool = False  # Debug flag to force full load
+    example_id_allowlist: Optional[list[str]] = None  # Filter to specific example IDs
+    ta_labeled_only: bool = True             # Skip examples without TA labels
+    max_scan_items: Optional[int] = None     # Max items to scan in streaming mode (None=unlimited)
+    
     # Model
     model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
     load_in_4bit: bool = True
@@ -82,6 +89,14 @@ class EdgePatchConfig:
             if value is not None and key in cls.__dataclass_fields__:
                 config_dict[key] = value
         
+        # Handle special CLI flags that map to different config names
+        if getattr(args, 'no_streaming', False):
+            config_dict['dataset_streaming'] = False
+        if getattr(args, 'example_ids', None):
+            config_dict['example_id_allowlist'] = args.example_ids
+        if getattr(args, 'include_unlabeled', False):
+            config_dict['ta_labeled_only'] = False
+        
         return cls(**config_dict)
 
 
@@ -109,6 +124,24 @@ def create_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-name", type=str)
     parser.add_argument("--dataset-split", type=str)
     parser.add_argument("--max-examples", type=int)
+    
+    # Streaming & filtering
+    parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        help="Disable streaming mode (forces full dataset materialization)"
+    )
+    parser.add_argument(
+        "--example-ids",
+        type=str,
+        nargs="+",
+        help="Filter to specific example IDs"
+    )
+    parser.add_argument(
+        "--include-unlabeled",
+        action="store_true",
+        help="Include examples without TA labels"
+    )
     
     # Model
     parser.add_argument("--model-name", type=str)
