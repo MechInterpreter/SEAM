@@ -9,12 +9,68 @@ from dataclasses import dataclass
 from typing import Iterator
 import json
 import logging
+import time
+import os
 
 from datasets import load_dataset
 
 from edgepatch.config import EdgePatchConfig
 
 logger = logging.getLogger("edgepatch")
+
+# Retry configuration for HuggingFace downloads
+MAX_RETRIES = 5
+INITIAL_BACKOFF_SECONDS = 2
+MAX_BACKOFF_SECONDS = 60
+HF_TIMEOUT_SECONDS = 120  # Increased timeout
+
+
+def _load_dataset_with_retry(dataset_name: str, split: str) -> any:
+    """
+    Load a HuggingFace dataset with retry logic and exponential backoff.
+    
+    Handles transient network errors like ReadTimeout.
+    """
+    # Set longer timeout for HuggingFace hub
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(HF_TIMEOUT_SECONDS))
+    
+    last_error = None
+    backoff = INITIAL_BACKOFF_SECONDS
+    
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            logger.info(f"Loading dataset (attempt {attempt}/{MAX_RETRIES})...")
+            ds = load_dataset(dataset_name, split=split)
+            logger.info(f"Dataset loaded successfully on attempt {attempt}")
+            return ds
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            
+            # Check if this is a retryable error
+            is_retryable = any(err in error_str for err in [
+                "timeout", "timed out", "connection", "network",
+                "temporarily unavailable", "503", "502", "429"
+            ])
+            
+            if not is_retryable:
+                logger.error(f"Non-retryable error: {e}")
+                raise
+            
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    f"Attempt {attempt} failed: {type(e).__name__}: {str(e)[:100]}... "
+                    f"Retrying in {backoff}s..."
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            else:
+                logger.error(f"All {MAX_RETRIES} attempts failed")
+    
+    raise RuntimeError(
+        f"Failed to load dataset after {MAX_RETRIES} attempts. "
+        f"Last error: {last_error}"
+    )
 
 
 @dataclass
@@ -55,7 +111,7 @@ def load_dataset_examples(config: EdgePatchConfig) -> Iterator[Example]:
     """
     logger.info(f"Loading dataset: {config.dataset_name} (split: {config.dataset_split})")
     
-    ds = load_dataset(config.dataset_name, split=config.dataset_split)
+    ds = _load_dataset_with_retry(config.dataset_name, config.dataset_split)
     
     count = 0
     for item in ds:
