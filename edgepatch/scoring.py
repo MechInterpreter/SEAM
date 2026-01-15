@@ -116,7 +116,7 @@ def compute_answer_logp(
     if show_diagnostics:
         print(f"\n[{_ts()}] [DIAGNOSTIC] Scoring Span (tokens {answer_start_token}-{answer_end_token}):", flush=True)
     
-    for i in range(answer_start_token, answer_end_token):
+    for i in range(int(answer_start_token), int(answer_end_token)):
         if i == 0:
             continue
         
