@@ -197,6 +197,13 @@ def create_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--no-verbose", action="store_false", dest="verbose")
     
+    # Incremental Drive sync (for Colab crash protection)
+    parser.add_argument(
+        "--drive-sync-dir",
+        type=str,
+        help="Path to Drive directory for incremental sync after each example (e.g., /content/drive/MyDrive/SEAM/runs/my_run)"
+    )
+    
     return parser
 
 

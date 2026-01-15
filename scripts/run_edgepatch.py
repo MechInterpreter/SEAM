@@ -219,6 +219,15 @@ def main():
                 }
                 all_results.append(result)
                 
+                # Incremental sync to Drive (if configured)
+                if getattr(args, 'drive_sync_dir', None):
+                    drive_sync_path = Path(args.drive_sync_dir)
+                    drive_sync_path.mkdir(parents=True, exist_ok=True)
+                    sync_file = drive_sync_path / "all_results_incremental.json"
+                    with open(sync_file, 'w') as f:
+                        json.dump(all_results, f, indent=2)
+                    print(f"[{_ts()}]   ☁️ Synced {len(all_results)} results to Drive", flush=True)
+                
             except AlignmentError as e:
                 # Alignment failure - log and continue (resample in confirm/main)
                 failed_info = {
