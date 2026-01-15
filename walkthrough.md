@@ -200,3 +200,18 @@ This is the failure mode we designed against. If you see this:
 1. Check that `attn_implementation="eager"` is set
 2. Check that the patched forward is actually being called (add debug prints)
 3. Run the toggle tests to isolate the issue
+
+## Robustness Update (Jan 15)
+We have hardened the pipeline against common failure modes:
+
+1. **Alignment Failure Handling**:
+   - The runner now automatically **resamples** examples when it encounters chunk alignment failures (e.g., character offsets not matching token boundaries).
+   - It will keep trying until the requested `max_examples` are successfully scored, capping at 50 consecutive failures to prevent infinite loops.
+   - Failed examples are logged to `failed_examples.jsonl` for offline debugging.
+
+2. **Scientific Controls**:
+   - Validation notebook cells (Smoke, Layer Toggle, Head Toggle) now use a **Pinned Example** (`problem_1591`) and **Extended Scoring Span** to ensuring strictly comparable results across runs.
+   - Large-scale runs (`confirm`, `main` modes) automatically use random streaming for coverage.
+
+3. **Bug Fix (Masked LogP = 0)**:
+   - Fixed a critical bug where `scoring_start` (token index) was shadowed by a timing variable, causing the masked pass to iterate over an empty range.
