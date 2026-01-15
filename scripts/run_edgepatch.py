@@ -55,6 +55,13 @@ def main():
         # Set default max_scan_items for smoke
         if not hasattr(args, 'max_scan_items') or getattr(args, 'max_scan_items', None) is None:
             base_config.max_scan_items = 2000
+            
+        # Set default layers/heads for smoke testing (diagnostic)
+        # Use mid-layers to ensure we see non-zero deltas if masking works
+        if args.edge_layers is None:
+            args.edge_layers = [15, 16]
+        if args.edge_heads is None:
+            args.edge_heads = [0]
     elif args.mode == "confirm":
         if args.max_examples is None:
             args.max_examples = 3
@@ -147,6 +154,7 @@ def main():
         for ex_idx, example in enumerate(examples):
             print(f"\n[{_ts()}] Example {ex_idx + 1}/{len(examples)}: {example.id}", flush=True)
             print(f"[{_ts()}]   Chunks: {example.num_chunks}, Answer length: {len(example.answer_text)} chars", flush=True)
+            print(f"[{_ts()}]   Answer text: {repr(example.answer_text)}", flush=True)
             
             try:
                 # Align chunks to tokens

@@ -88,39 +88,62 @@ def compute_answer_logp(
     input_ids: torch.Tensor,
     answer_start_token: int,
     answer_end_token: int,
+    tokenizer=None,
+    device=None
 ) -> float:
     """
     Compute log-probability of answer tokens given the context.
     
-    Uses teacher-forcing: the answer tokens are in the input,
-    and we compute P(answer_token | all_previous_tokens) for each.
-    
-    Returns:
-        Sum of log-probabilities for answer tokens
+    Includes detailed diagnostics to debug baseline logP degeneracy.
     """
     with torch.no_grad():
         outputs = model(input_ids, use_cache=False)
         logits = outputs.logits  # [batch, seq_len, vocab]
     
     # For each answer token, get the log-prob from the previous position's prediction
-    # P(token_i) is predicted at position i-1
     log_probs = []
+    
+    # Only print diagnostics if tokenizer provided (usually for baseline)
+    show_diagnostics = (tokenizer is not None)
+    
+    if show_diagnostics:
+        print(f"\n[{_ts()}] [DIAGNOSTIC] Scoring Answer Span (tokens {answer_start_token}-{answer_end_token}):", flush=True)
     
     for i in range(answer_start_token, answer_end_token):
         if i == 0:
-            continue  # Can't predict the first token
+            continue
         
         # Get logits at position i-1 predicting token at position i
-        logits_at_pos = logits[0, i - 1, :]  # [vocab]
+        logits_at_pos = logits[0, i - 1, :]
         log_probs_at_pos = F.log_softmax(logits_at_pos, dim=-1)
         
-        # Get the actual token at position i
-        target_token = input_ids[0, i]
-        
-        # Get log-prob of the target token
-        log_prob = log_probs_at_pos[target_token].item()
+        # Target
+        target_token_id = input_ids[0, i].item()
+        log_prob = log_probs_at_pos[target_token_id].item()
         log_probs.append(log_prob)
-    
+        
+        # Detailed diagnostics
+        if show_diagnostics:
+            probs = F.softmax(logits_at_pos, dim=-1)
+            target_prob = probs[target_token_id].item()
+            target_str = tokenizer.decode([target_token_id])
+            
+            # Rank
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            rank = (sorted_indices == target_token_id).nonzero(as_tuple=True)[0].item() + 1
+            
+            # Top-3 info
+            top3_indices = sorted_indices[:3]
+            top3_info = []
+            for idx in top3_indices:
+                tok_str = tokenizer.decode([idx]).replace('\n', '\\n')
+                prob = probs[idx].item()
+                top3_info.append(f"'{tok_str}' ({prob:.4f})")
+            
+            print(f"  Pos {i} | Target: {repr(target_str)} (id: {target_token_id}) | "
+                  f"LogP: {log_prob:.4f} | Prob: {target_prob:.4f} | Rank: {rank}", flush=True)
+            print(f"    Top-3: {', '.join(top3_info)}", flush=True)
+            
     return sum(log_probs)
 
 
@@ -206,7 +229,8 @@ def compute_chunk_scores(
     baseline_start = time.time()
     
     baseline_logp = compute_answer_logp(
-        model, input_ids, answer_span.start_token, answer_span.end_token
+        model, input_ids, answer_span.start_token, answer_span.end_token,
+        tokenizer=tokenizer  # Enable diagnostics for baseline
     )
     
     baseline_elapsed = time.time() - baseline_start
