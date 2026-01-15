@@ -162,11 +162,13 @@ def load_dataset_examples(config: EdgePatchConfig) -> Iterator[Example]:
     print(f"[{_ts()}]   Streaming: {config.dataset_streaming}", flush=True)
     print(f"[{_ts()}]   TA-labeled only: {config.ta_labeled_only} (field: {config.ta_label_field})", flush=True)
     print(f"[{_ts()}]   Allowlist: {len(config.example_id_allowlist or [])} IDs", flush=True)
+    print(f"[{_ts()}]   Denylist: {len(config.example_id_denylist or [])} IDs", flush=True)
     print(f"[{_ts()}]   Max examples: {config.max_examples}", flush=True)
     print(f"[{_ts()}]   Max scan items: {config.max_scan_items or 'unlimited'}", flush=True)
     
-    # Build allowlist set for O(1) lookup
+    # Build allowlist and denylist sets for O(1) lookup
     allowlist = set(config.example_id_allowlist) if config.example_id_allowlist else None
+    denylist = set(config.example_id_denylist) if config.example_id_denylist else None
     
     # Determine streaming mode
     use_streaming = config.dataset_streaming and not config.force_materialize_dataset
@@ -188,6 +190,7 @@ def load_dataset_examples(config: EdgePatchConfig) -> Iterator[Example]:
     scanned_files = 0
     yielded_count = 0
     skipped_not_in_allowlist = 0
+    skipped_in_denylist = 0
     skipped_unlabeled = 0
     skipped_incomplete = 0
     skipped_parse_error = 0
@@ -243,6 +246,11 @@ def load_dataset_examples(config: EdgePatchConfig) -> Iterator[Example]:
         if allowlist and problem_id not in allowlist:
             skipped_not_in_allowlist += 1
             # We can skip storing content for filtered IDs
+            continue
+        
+        # 2b. Denylist Check (Exclude previously processed)
+        if denylist and problem_id in denylist:
+            skipped_in_denylist += 1
             continue
 
         # 3. Store Content
@@ -306,6 +314,7 @@ def load_dataset_examples(config: EdgePatchConfig) -> Iterator[Example]:
     print(f"[{_ts()}]   Skipped (allowlist): {skipped_not_in_allowlist}", flush=True) # approx (count files)
     print(f"[{_ts()}]   Skipped (unlabeled): {skipped_unlabeled}", flush=True)
     print(f"[{_ts()}]   Skipped (parse err): {skipped_parse_error}", flush=True)
+    print(f"[{_ts()}]   Skipped (denylist): {skipped_in_denylist}", flush=True)
     print(f"[{_ts()}]   Time: {elapsed:.1f}s", flush=True)
     print(f"[{_ts()}] {'='*60}", flush=True)
 

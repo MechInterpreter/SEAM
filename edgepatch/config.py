@@ -22,6 +22,7 @@ class EdgePatchConfig:
     dataset_streaming: bool = True           # Use streaming=True to avoid full materialization
     force_materialize_dataset: bool = False  # Debug flag to force full load
     example_id_allowlist: Optional[list[str]] = None  # Filter to specific example IDs
+    example_id_denylist: Optional[list[str]] = None   # Exclude specific example IDs (e.g., already processed)
     ta_labeled_only: bool = True             # Skip examples without TA labels
     max_scan_items: Optional[int] = None     # Max items to scan in streaming mode (None=unlimited)
     solution_type: str = "correct_base_solution" # Subdirectory to load (e.g. correct_base_solution)
@@ -98,6 +99,8 @@ class EdgePatchConfig:
             config_dict['dataset_streaming'] = False
         if getattr(args, 'example_ids', None):
             config_dict['example_id_allowlist'] = args.example_ids
+        if getattr(args, 'exclude_ids', None):
+            config_dict['example_id_denylist'] = args.exclude_ids
         if getattr(args, 'include_unlabeled', False):
             config_dict['ta_labeled_only'] = False
         
@@ -140,6 +143,12 @@ def create_arg_parser() -> argparse.ArgumentParser:
         type=str,
         nargs="+",
         help="Filter to specific example IDs"
+    )
+    parser.add_argument(
+        "--exclude-ids",
+        type=str,
+        nargs="+",
+        help="Exclude specific example IDs (e.g., already processed)"
     )
     parser.add_argument(
         "--include-unlabeled",
