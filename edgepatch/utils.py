@@ -95,3 +95,10 @@ class RunArtifacts:
     def load_metrics(self) -> dict:
         """Load metrics from file."""
         return load_json(self.metrics_path)
+    
+    def save_failed_examples(self, failed: list[dict]) -> None:
+        """Write failed_examples.jsonl for debugging alignment failures."""
+        path = self.run_dir / "failed_examples.jsonl"
+        with open(path, 'w') as f:
+            for ex in failed:
+                f.write(json.dumps(ex, default=str) + "\n")
