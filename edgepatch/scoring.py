@@ -8,6 +8,9 @@ and calculates per-chunk importance scores.
 from dataclasses import dataclass
 from typing import Optional
 import logging
+import time
+import threading
+from datetime import datetime
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +21,50 @@ from edgepatch.spans import TokenSpan
 from edgepatch.masking import ScopedAttentionMasker
 
 logger = logging.getLogger("edgepatch")
+
+
+def _ts() -> str:
+    """Return current timestamp string for logging."""
+    return datetime.now().strftime("%H:%M:%S")
+
+
+class Heartbeat:
+    """
+    Background heartbeat thread that prints a message every N seconds.
+    
+    Confirms the process is still alive even if no chunk has finished.
+    """
+    
+    def __init__(self, interval_seconds: float = 30.0, context: str = ""):
+        self.interval = interval_seconds
+        self.context = context
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start_time = 0.0
+        self._current_chunk = 0
+        self._total_chunks = 0
+    
+    def update_progress(self, current_chunk: int, total_chunks: int):
+        """Update current progress for heartbeat messages."""
+        self._current_chunk = current_chunk
+        self._total_chunks = total_chunks
+    
+    def _run(self):
+        while not self._stop_event.wait(self.interval):
+            elapsed = time.time() - self._start_time
+            progress = f"{self._current_chunk}/{self._total_chunks}" if self._total_chunks > 0 else "starting"
+            print(f"[{_ts()}] 💓 HEARTBEAT: {self.context} | progress={progress} | elapsed={elapsed:.1f}s", flush=True)
+    
+    def start(self):
+        self._start_time = time.time()
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+    
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
 
 
 @dataclass
@@ -98,7 +145,36 @@ def compute_chunk_scores(
     """
     device = next(model.parameters()).device
     
-    # Tokenize the full text
+    # ================================================================
+    # STARTUP BANNER
+    # ================================================================
+    num_chunks = len(chunk_spans)
+    num_layers = model_info.get("num_layers", 32)
+    num_heads = model_info.get("num_heads", 32)
+    
+    # Determine actual layers/heads being tested
+    layers_to_test = config.edge_layers if config.edge_layers else list(range(num_layers))
+    heads_to_test = config.edge_heads if config.edge_heads else list(range(num_heads))
+    
+    # Estimate forward passes: 1 baseline + N chunks
+    # (Each chunk = 1 forward pass through model with patched attention)
+    estimated_forwards = 1 + num_chunks
+    
+    print(f"\n[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}] SCORING CONFIGURATION", flush=True)
+    print(f"[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}]   Chunks to score:        {num_chunks}", flush=True)
+    print(f"[{_ts()}]   Layers being masked:    {len(layers_to_test)} (indices: {layers_to_test[:5]}{'...' if len(layers_to_test) > 5 else ''})", flush=True)
+    print(f"[{_ts()}]   Heads being masked:     {len(heads_to_test)} (indices: {heads_to_test[:5]}{'...' if len(heads_to_test) > 5 else ''})", flush=True)
+    print(f"[{_ts()}]   Estimated forward passes: {estimated_forwards}", flush=True)
+    print(f"[{_ts()}] {'='*60}\n", flush=True)
+    
+    # ================================================================
+    # TOKENIZATION PHASE
+    # ================================================================
+    print(f"[{_ts()}] PHASE: Tokenization...", flush=True)
+    tok_start = time.time()
+    
     encoding = tokenizer(
         example.full_text,
         return_tensors="pt",
@@ -106,8 +182,10 @@ def compute_chunk_scores(
         max_length=config.max_seq_len,
     )
     input_ids = encoding["input_ids"].to(device)
-    
     seq_len = input_ids.shape[1]
+    
+    tok_elapsed = time.time() - tok_start
+    print(f"[{_ts()}] PHASE: Tokenization complete ({tok_elapsed:.2f}s) | seq_len={seq_len}", flush=True)
     
     # Validate spans are within bounds
     if answer_span.end_token > seq_len:
@@ -121,72 +199,103 @@ def compute_chunk_scores(
             text=answer_span.text,
         )
     
-    # Compute baseline log-probability (no masking)
+    # ================================================================
+    # BASELINE FORWARD PASS
+    # ================================================================
+    print(f"[{_ts()}] PHASE: Computing baseline logP (1 forward pass)...", flush=True)
+    baseline_start = time.time()
+    
     baseline_logp = compute_answer_logp(
         model, input_ids, answer_span.start_token, answer_span.end_token
     )
     
-    if config.verbose:
-        logger.info(f"Baseline logP(answer): {baseline_logp:.4f}")
+    baseline_elapsed = time.time() - baseline_start
+    print(f"[{_ts()}] PHASE: Baseline complete ({baseline_elapsed:.2f}s) | logP={baseline_logp:.4f}", flush=True)
     
-    # Compute masked log-probability for each chunk
+    # ================================================================
+    # MASKED FORWARD PASSES (main loop)
+    # ================================================================
+    print(f"\n[{_ts()}] PHASE: Scoring {num_chunks} chunks (masked forward passes)...", flush=True)
+    
     scores = []
     q_positions = list(range(answer_span.start_token, answer_span.end_token))
     
-    for chunk_idx, chunk_span in enumerate(chunk_spans):
-        # Skip if chunk span is out of bounds
-        if chunk_span.end_token > seq_len:
-            logger.warning(f"Chunk {chunk_idx} span exceeds seq_len, skipping")
-            continue
-        
-        k_positions = list(range(chunk_span.start_token, chunk_span.end_token))
-        
-        # Apply scoped masking
-        with ScopedAttentionMasker(
-            model,
-            model_info,
-            config.edge_layers,
-            config.edge_heads,
-            validate_on_exit=True,
-        ) as masker:
-            masker.set_mask_positions(q_positions, k_positions)
+    # Start heartbeat
+    heartbeat = Heartbeat(interval_seconds=30.0, context=f"Scoring example {example.id}")
+    heartbeat.update_progress(0, num_chunks)
+    heartbeat.start()
+    
+    scoring_start = time.time()
+    
+    try:
+        for chunk_idx, chunk_span in enumerate(chunk_spans):
+            chunk_start = time.time()
             
-            # Compute masked log-probability
-            masked_logp = compute_answer_logp(
-                model, input_ids, answer_span.start_token, answer_span.end_token
-            )
+            # Update heartbeat
+            heartbeat.update_progress(chunk_idx, num_chunks)
             
-            # Get instrumentation
-            stats = masker.stats
-        
-        delta = masked_logp - baseline_logp
-        
-        # Probe output for chunk 0
-        if chunk_idx == 0 and config.probe_chunk_0:
-            logger.info(
-                f"[PROBE] Chunk 0: baseline={baseline_logp:.4f}, "
-                f"masked={masked_logp:.4f}, delta={delta:.4f}"
-            )
-            logger.info(f"[PROBE] layers_mask_applied={sorted(stats.layers_mask_applied)}")
-            logger.info(f"[PROBE] heads_mask_applied={stats.heads_mask_applied}")
-            logger.info(f"[PROBE] masked_entries_count={stats.masked_entries_count}")
-        
-        scores.append(ChunkScore(
-            chunk_idx=chunk_idx,
-            delta_logp=delta,
-            abs_delta_logp=abs(delta),
-            baseline_logp=baseline_logp,
-            masked_logp=masked_logp,
-            ta_label=example.chunks[chunk_idx].ta_label,
-            layers_mask_applied=sorted(stats.layers_mask_applied),
-            heads_mask_applied={k: sorted(v) for k, v in stats.heads_mask_applied.items()},
-            masked_entries_count=stats.masked_entries_count,
-        ))
-        
-        if config.verbose and chunk_idx % 5 == 0:
-            logger.debug(
-                f"Chunk {chunk_idx}/{len(chunk_spans)}: delta={delta:.4f}"
-            )
+            # Progress log for every chunk
+            print(f"[{_ts()}] Processing chunk {chunk_idx + 1}/{num_chunks} (tokens {chunk_span.start_token}-{chunk_span.end_token})...", flush=True)
+            
+            # Skip if chunk span is out of bounds
+            if chunk_span.end_token > seq_len:
+                logger.warning(f"Chunk {chunk_idx} span exceeds seq_len, skipping")
+                continue
+            
+            k_positions = list(range(chunk_span.start_token, chunk_span.end_token))
+            
+            # Apply scoped masking
+            with ScopedAttentionMasker(
+                model,
+                model_info,
+                config.edge_layers,
+                config.edge_heads,
+                validate_on_exit=True,
+            ) as masker:
+                masker.set_mask_positions(q_positions, k_positions)
+                
+                # Compute masked log-probability
+                masked_logp = compute_answer_logp(
+                    model, input_ids, answer_span.start_token, answer_span.end_token
+                )
+                
+                # Get instrumentation
+                stats = masker.stats
+            
+            delta = masked_logp - baseline_logp
+            chunk_elapsed = time.time() - chunk_start
+            
+            # Detailed log for first chunk
+            if chunk_idx == 0 and config.probe_chunk_0:
+                print(f"[{_ts()}] [PROBE] Chunk 0: baseline={baseline_logp:.4f}, masked={masked_logp:.4f}, delta={delta:.4f}", flush=True)
+                print(f"[{_ts()}] [PROBE] layers_mask_applied={sorted(stats.layers_mask_applied)}", flush=True)
+                print(f"[{_ts()}] [PROBE] heads_mask_applied={stats.heads_mask_applied}", flush=True)
+                print(f"[{_ts()}] [PROBE] masked_entries_count={stats.masked_entries_count}", flush=True)
+            
+            # Progress summary every chunk
+            print(f"[{_ts()}] Chunk {chunk_idx + 1}/{num_chunks} complete ({chunk_elapsed:.2f}s) | delta={delta:.4f}", flush=True)
+            
+            scores.append(ChunkScore(
+                chunk_idx=chunk_idx,
+                delta_logp=delta,
+                abs_delta_logp=abs(delta),
+                baseline_logp=baseline_logp,
+                masked_logp=masked_logp,
+                ta_label=example.chunks[chunk_idx].ta_label,
+                layers_mask_applied=sorted(stats.layers_mask_applied),
+                heads_mask_applied={k: sorted(v) for k, v in stats.heads_mask_applied.items()},
+                masked_entries_count=stats.masked_entries_count,
+            ))
+    
+    finally:
+        heartbeat.stop()
+    
+    scoring_elapsed = time.time() - scoring_start
+    
+    print(f"\n[{_ts()}] PHASE: Scoring complete", flush=True)
+    print(f"[{_ts()}]   Total chunks scored: {len(scores)}", flush=True)
+    print(f"[{_ts()}]   Total scoring time:  {scoring_elapsed:.2f}s", flush=True)
+    print(f"[{_ts()}]   Avg time per chunk:  {scoring_elapsed/max(len(scores),1):.2f}s", flush=True)
     
     return scores
 

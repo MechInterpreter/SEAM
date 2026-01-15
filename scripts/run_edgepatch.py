@@ -18,6 +18,7 @@ import time
 import json
 from dataclasses import asdict
 from pathlib import Path
+from datetime import datetime
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -29,6 +30,11 @@ from edgepatch.model import load_model_and_tokenizer
 from edgepatch.scoring import compute_chunk_scores, ChunkScore
 from edgepatch.eval import compute_metrics, print_metrics_summary
 from edgepatch.utils import setup_logging, get_run_dir, RunArtifacts
+
+
+def _ts() -> str:
+    """Return current timestamp string for logging."""
+    return datetime.now().strftime("%H:%M:%S")
 
 
 def main():
@@ -60,42 +66,72 @@ def main():
     run_dir = get_run_dir(config.output_dir, config.run_name)
     artifacts = RunArtifacts(run_dir)
     
-    logger.info(f"=" * 60)
-    logger.info(f"EdgePatch Run: {args.mode}")
-    logger.info(f"Output: {run_dir}")
-    logger.info(f"=" * 60)
+    print(f"\n[{_ts()}] {'='*60}", flush=True)
+    print(f"[{_ts()}] EdgePatch Run: {args.mode.upper()}", flush=True)
+    print(f"[{_ts()}] Output: {run_dir}", flush=True)
+    print(f"[{_ts()}] {'='*60}", flush=True)
     
     # Save config
     artifacts.save_config(config.to_dict())
     
     # Log edge masking config (CRITICAL)
-    logger.info(f"Edge layers: {config.edge_layers or 'ALL'}")
-    logger.info(f"Edge heads: {config.edge_heads or 'ALL'}")
+    print(f"[{_ts()}] Edge layers: {config.edge_layers or 'ALL'}", flush=True)
+    print(f"[{_ts()}] Edge heads: {config.edge_heads or 'ALL'}", flush=True)
+    print(f"[{_ts()}] Max examples: {config.max_examples}", flush=True)
     
     start_time = time.time()
     
     try:
-        # Load model
-        logger.info("Loading model...")
-        model, tokenizer, model_info = load_model_and_tokenizer(config)
-        logger.info(f"Model loaded: {model_info['num_layers']} layers, {model_info['num_heads']} heads")
+        # ================================================================
+        # PHASE 1: MODEL LOADING
+        # ================================================================
+        print(f"\n[{_ts()}] {'='*60}", flush=True)
+        print(f"[{_ts()}] PHASE 1: MODEL LOADING", flush=True)
+        print(f"[{_ts()}] {'='*60}", flush=True)
+        print(f"[{_ts()}] Loading {config.model_name}...", flush=True)
+        print(f"[{_ts()}] (This may take 2-3 minutes on first run)", flush=True)
         
-        # Load dataset
-        logger.info("Loading dataset...")
+        model_start = time.time()
+        model, tokenizer, model_info = load_model_and_tokenizer(config)
+        model_elapsed = time.time() - model_start
+        
+        print(f"[{_ts()}] Model loaded in {model_elapsed:.1f}s", flush=True)
+        print(f"[{_ts()}]   Layers: {model_info['num_layers']}", flush=True)
+        print(f"[{_ts()}]   Heads:  {model_info['num_heads']}", flush=True)
+        
+        # ================================================================
+        # PHASE 2: DATASET LOADING
+        # ================================================================
+        print(f"\n[{_ts()}] {'='*60}", flush=True)
+        print(f"[{_ts()}] PHASE 2: DATASET LOADING", flush=True)
+        print(f"[{_ts()}] {'='*60}", flush=True)
+        print(f"[{_ts()}] Loading dataset: {config.dataset_name}...", flush=True)
+        
+        dataset_start = time.time()
         examples = list(load_dataset_examples(config))
-        logger.info(f"Loaded {len(examples)} examples")
+        dataset_elapsed = time.time() - dataset_start
+        
+        print(f"[{_ts()}] Dataset loaded in {dataset_elapsed:.1f}s", flush=True)
+        print(f"[{_ts()}]   Examples: {len(examples)}", flush=True)
         
         if not examples:
-            logger.error("No examples loaded!")
+            print(f"[{_ts()}] ERROR: No examples loaded!", flush=True)
             return 1
+        
+        # ================================================================
+        # PHASE 3: SCORING EXAMPLES
+        # ================================================================
+        print(f"\n[{_ts()}] {'='*60}", flush=True)
+        print(f"[{_ts()}] PHASE 3: SCORING EXAMPLES", flush=True)
+        print(f"[{_ts()}] {'='*60}", flush=True)
         
         # Process each example
         all_results = []
         all_scores = []
         
         for ex_idx, example in enumerate(examples):
-            logger.info(f"\nProcessing example {ex_idx + 1}/{len(examples)}: {example.id}")
-            logger.info(f"  Chunks: {example.num_chunks}, Answer length: {len(example.answer_text)}")
+            print(f"\n[{_ts()}] Example {ex_idx + 1}/{len(examples)}: {example.id}", flush=True)
+            print(f"[{_ts()}]   Chunks: {example.num_chunks}, Answer length: {len(example.answer_text)} chars", flush=True)
             
             try:
                 # Align chunks to tokens
