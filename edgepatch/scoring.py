@@ -238,18 +238,19 @@ def compute_chunk_scores(
     # SCORING SPAN CALCULATION
     # ================================================================
     # Determine actual span to score based on config
-    scoring_start = answer_span.start_token
-    scoring_end = answer_span.end_token
+    # Ensure these are always ints (CLI args may come as floats)
+    scoring_start = int(answer_span.start_token)
+    scoring_end = int(answer_span.end_token)
     
     if config.score_span == "extended":
         # Extend backwards to include more tokens (less saturated)
-        scoring_start = max(1, answer_span.start_token - config.score_extend_tokens)
+        scoring_start = int(max(1, answer_span.start_token - config.score_extend_tokens))
         print(f"[{_ts()}] Extended scoring span: tokens {scoring_start}-{scoring_end} "
               f"(+{answer_span.start_token - scoring_start} reasoning tokens)", flush=True)
     elif config.score_span == "reasoning_only":
         # Score only the tokens before the answer (last chunk of reasoning)
-        scoring_end = answer_span.start_token
-        scoring_start = max(1, scoring_end - config.score_extend_tokens)
+        scoring_end = int(answer_span.start_token)
+        scoring_start = int(max(1, scoring_end - config.score_extend_tokens))
         print(f"[{_ts()}] Reasoning-only span: tokens {scoring_start}-{scoring_end}", flush=True)
     else:  # answer_only
         print(f"[{_ts()}] Answer-only span: tokens {scoring_start}-{scoring_end}", flush=True)
