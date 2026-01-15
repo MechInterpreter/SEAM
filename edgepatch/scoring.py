@@ -322,8 +322,10 @@ def compute_chunk_scores(
                 masker.set_mask_positions(q_positions, k_positions)
                 
                 # Compute masked log-probability (use same span as baseline!)
+                # For chunk 0, enable diagnostics to debug the masked=0.0 issue
                 masked_logp = compute_answer_logp(
-                    model, input_ids, scoring_start, scoring_end
+                    model, input_ids, scoring_start, scoring_end,
+                    tokenizer=tokenizer if chunk_idx == 0 else None  # Diagnostics for first chunk
                 )
                 
                 # Get instrumentation
