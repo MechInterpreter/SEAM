@@ -15,7 +15,7 @@ class EdgePatchConfig:
     
     # Dataset
     dataset_name: str = "uzaymacar/math-rollouts"
-    dataset_split: str = "train"
+    dataset_split: str = "default"  # This dataset uses 'default' not 'train'
     max_examples: int = 10
     
     # Streaming & filtering (NEW)
