@@ -24,6 +24,7 @@ class EdgePatchConfig:
     example_id_allowlist: Optional[list[str]] = None  # Filter to specific example IDs
     ta_labeled_only: bool = True             # Skip examples without TA labels
     max_scan_items: Optional[int] = None     # Max items to scan in streaming mode (None=unlimited)
+    solution_type: str = "correct_base_solution" # Subdirectory to load (e.g. correct_base_solution)
     
     # Model
     model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"

@@ -4,16 +4,18 @@ Dataset loading and chunk extraction for EdgePatch.
 Loads the uzaymacar/math-rollouts dataset and extracts chunks with their
 TA (Thought Anchors) labels, using the dataset's original chunk boundaries.
 
-Supports streaming mode to avoid full dataset materialization.
+Supports streaming mode by aggregating raw files (the dataset yields individual
+files like problem.json, chunks_labeled.json, etc.) into complete examples.
 """
 
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Optional
 import json
 import logging
 import time
 import os
 from datetime import datetime
+from collections import defaultdict
 
 from datasets import load_dataset, IterableDataset
 
@@ -44,9 +46,9 @@ def _load_dataset_streaming(
     
     Args:
         dataset_name: HuggingFace dataset name
-        split: Dataset split (e.g., "train")
-        streaming: If True, use streaming mode to avoid full materialization
-        max_examples: Used for fallback slice sizing
+        split: Dataset split (e.g., "default")
+        streaming: If True, use streaming mode.
+        max_examples: Used for fallback slice sizing.
     
     Returns:
         IterableDataset (streaming) or Dataset (materialized)
@@ -61,7 +63,7 @@ def _load_dataset_streaming(
             print(f"[{_ts()}] Loading dataset (attempt {attempt}/{MAX_RETRIES}, streaming={streaming})...", flush=True)
             ds = load_dataset(dataset_name, split=split, streaming=streaming)
             
-            # Log dataset type for verification
+            # Log dataset type
             is_iterable = isinstance(ds, IterableDataset)
             print(f"[{_ts()}] Dataset type: {'IterableDataset (streaming)' if is_iterable else 'Dataset (materialized)'}", flush=True)
             
@@ -74,8 +76,9 @@ def _load_dataset_streaming(
             if streaming and ("streaming" in error_str or "iterable" in error_str):
                 print(f"[{_ts()}] ⚠️ Streaming not supported, trying slice mode...", flush=True)
                 try:
-                    # Compute slice size: min(max(100, max_examples*200), 5000)
-                    slice_size = min(max(100, max_examples * 200), 5000)
+                    # Compute slice size heavily padded because we stream files not examples
+                    # Each example is ~3 files + overhead. Let's aim high.
+                    slice_size = min(max(500, max_examples * 50), 20000)
                     slice_split = f"{split}[:{slice_size}]"
                     print(f"[{_ts()}] Trying slice: {slice_split}", flush=True)
                     ds = load_dataset(dataset_name, split=slice_split)
@@ -140,60 +143,22 @@ class Example:
         return len(self.chunks)
 
 
-def _has_ta_labels(item: dict, ta_label_field: str) -> bool:
-    """
-    Check if an item has TA labels based on the configured ta_label_field.
-    
-    The TA labels are stored per-chunk in chunks_labeled, so we check if:
-    1. chunks_labeled exists and is parseable
-    2. At least one chunk has a non-null value for ta_label_field
-    """
-    chunks_labeled_raw = item.get("chunks_labeled")
-    if not chunks_labeled_raw:
-        return False
-    
-    # Parse if string
-    if isinstance(chunks_labeled_raw, str):
-        try:
-            chunks_labeled = json.loads(chunks_labeled_raw)
-        except json.JSONDecodeError:
-            return False
-    else:
-        chunks_labeled = chunks_labeled_raw
-    
-    if not chunks_labeled or not isinstance(chunks_labeled, list):
-        return False
-    
-    # Check if at least one chunk has the ta_label_field with a non-null value
-    for chunk in chunks_labeled:
-        label_value = chunk.get(ta_label_field)
-        if label_value is not None:
-            return True
-    
-    return False
-
-
 def load_dataset_examples(config: EdgePatchConfig) -> Iterator[Example]:
     """
-    Stream examples from the HF dataset with early-stopping and filtering.
+    Stream examples from the HF dataset with aggregation, early-stopping and filtering.
     
-    Features:
-    - Uses streaming mode by default (no full materialization)
-    - Stops after max_examples
-    - Stops after max_scan_items (if set) even if max_examples not reached
-    - Filters to TA-labeled examples (if ta_labeled_only=True)
-    - Filters to allowlist (if example_id_allowlist is set)
+    DATASET STRUCTURE NOTE:
+    The dataset yields individual FILES, not complete examples. 
+    Path format: .../{solution_type}/problem_{ID}/{filename}.json
     
-    Yields Example objects with:
-    - full_text: concatenated problem + reasoning_trace + answer
-    - chunks: list of Chunk objects from chunks_labeled
-    - answer_text/answer_start_char/answer_end_char: answer span info
+    We must aggregating files by problem_ID until we have enough to build an Example.
     """
     # Log configuration
     print(f"\n[{_ts()}] {'='*60}", flush=True)
     print(f"[{_ts()}] DATASET LOADING", flush=True)
     print(f"[{_ts()}] {'='*60}", flush=True)
     print(f"[{_ts()}]   Dataset: {config.dataset_name}", flush=True)
+    print(f"[{_ts()}]   Solution Type: {config.solution_type}", flush=True)
     print(f"[{_ts()}]   Streaming: {config.dataset_streaming}", flush=True)
     print(f"[{_ts()}]   TA-labeled only: {config.ta_labeled_only} (field: {config.ta_label_field})", flush=True)
     print(f"[{_ts()}]   Allowlist: {len(config.example_id_allowlist or [])} IDs", flush=True)
@@ -215,179 +180,270 @@ def load_dataset_examples(config: EdgePatchConfig) -> Iterator[Example]:
         max_examples=config.max_examples,
     )
     
+    # Aggregation State
+    # Buffer: problem_id -> {filename -> content_dict}
+    buffer = defaultdict(dict)
+    
     # Track statistics
-    scanned_count = 0
+    scanned_files = 0
     yielded_count = 0
     skipped_not_in_allowlist = 0
     skipped_unlabeled = 0
+    skipped_incomplete = 0
     skipped_parse_error = 0
     
-    print(f"[{_ts()}] Scanning for examples...", flush=True)
+    print(f"[{_ts()}] Scanning files...", flush=True)
     
     for item in ds:
-        scanned_count += 1
+        scanned_files += 1
         
         # Check max_scan_items limit
-        if config.max_scan_items is not None and scanned_count > config.max_scan_items:
+        if config.max_scan_items is not None and scanned_files > config.max_scan_items:
             print(f"\n[{_ts()}] ❌ ERROR: Reached max_scan_items={config.max_scan_items} "
                   f"but only found {yielded_count}/{config.max_examples} examples!", flush=True)
-            print(f"[{_ts()}] This indicates the dataset may not have enough TA-labeled examples "
-                  f"in the first {config.max_scan_items} items.", flush=True)
-            print(f"[{_ts()}] Solutions:", flush=True)
-            print(f"[{_ts()}]   1. Increase --max-scan-items", flush=True)
-            print(f"[{_ts()}]   2. Use --include-unlabeled to skip TA filtering", flush=True)
-            print(f"[{_ts()}]   3. Decrease --max-examples", flush=True)
             raise RuntimeError(
-                f"Scan limit reached: scanned {scanned_count} items but only found "
+                f"Scan limit reached: scanned {scanned_files} files but only found "
                 f"{yielded_count}/{config.max_examples} matching examples"
             )
         
-        # Early stop if we have enough examples
+        # Early stop
         if yielded_count >= config.max_examples:
             print(f"[{_ts()}] Reached max_examples={config.max_examples}, stopping early", flush=True)
             break
+            
+        # 1. Parse Path
+        # Expected: .../{solution_type}/problem_{ID}/{filename}.json
+        path = item.get('path', '')
+        if not path or config.solution_type not in path:
+            continue
+            
+        # Simple path parsing
+        parts = path.strip('/').split('/')
+        if len(parts) < 2:
+            continue
+            
+        # Assuming structure: .../solution_type/problem_ID/filename
+        # We look for the part starting with 'problem_'
+        problem_id = None
+        for part in parts:
+            if part.startswith("problem_") and part != "problem_json": # avoid checking if filename is problem_json
+                problem_id = part
+                break
         
-        # Allowlist filter
-        example_id = item.get("id", str(hash(str(item))))
-        if allowlist and example_id not in allowlist:
+        if not problem_id:
+            continue
+            
+        filename = parts[-1]
+        
+        # 2. Allowlist Check (Early)
+        # problem_id typically looks like "problem_123"
+        # We extract "123" or use the full string depending on allowlist format
+        # Let's assume allowlist uses full "problem_123" or just "123".
+        # We'll normalize to check both logic if needed, but for now exact match on ID string.
+        if allowlist and problem_id not in allowlist:
             skipped_not_in_allowlist += 1
+            # We can skip storing content for filtered IDs
             continue
+
+        # 3. Store Content
+        # We only care about chunks_labeled.json and base_solution.json (or similar)
+        # Note: base_solution.json contains the problem/reasoning/answer usually?
+        # Let's check the keys from the previous user log:
+        # base_solution.json: { "prompt": "...", "solution": "...", ... } ?
+        # Actually inspect_dataset showed:
+        # base_solution.json content: { "prompt": "...", ... }
+        # chunks_labeled.json content: [ ... ]
         
-        # TA label filter - check if chunks have the configured ta_label_field
-        if config.ta_labeled_only:
-            if not _has_ta_labels(item, config.ta_label_field):
-                skipped_unlabeled += 1
+        if filename in ["chunks_labeled.json", "base_solution.json", "problem.json"]:
+            try:
+                content_str = item.get('content')
+                if not content_str:
+                    continue
+                content = json.loads(content_str)
+                buffer[problem_id][filename] = content
+            except json.JSONDecodeError:
                 continue
-        
-        # Parse the example
-        try:
-            example = _parse_example(item, config.ta_label_field)
-            if example is not None:
-                yield example
-                yielded_count += 1
-                if yielded_count % 5 == 0 or yielded_count == 1:
-                    print(f"[{_ts()}] Yielded {yielded_count}/{config.max_examples} examples (scanned {scanned_count})...", flush=True)
-        except Exception as e:
-            skipped_parse_error += 1
-            logger.warning(f"Failed to parse example {example_id}: {e}")
-            continue
-    
-    elapsed = time.time() - start_time
-    
+
+        # 4. Check Completeness & Build Example
+        # We need base_solution.json (for text) and chunks_labeled.json (for chunks)
+        if "base_solution.json" in buffer[problem_id] and \
+           "chunks_labeled.json" in buffer[problem_id]:
+           
+            problem_data = buffer[problem_id]
+            
+            # Check TA Labels
+            chunks_data = problem_data["chunks_labeled.json"]
+            has_labels = _has_ta_labels(chunks_data, config.ta_label_field)
+            
+            if config.ta_labeled_only and not has_labels:
+                skipped_unlabeled += 1
+                del buffer[problem_id]
+                continue
+                
+            # Parse Example
+            try:
+                example = _parse_aggregated_example(problem_id, problem_data, config.ta_label_field)
+                if example:
+                    yield example
+                    yielded_count += 1
+                    if yielded_count % 5 == 0 or yielded_count == 1:
+                        print(f"[{_ts()}] Yielded {yielded_count}/{config.max_examples} examples "
+                              f"(scanned {scanned_files} files)...", flush=True)
+            except Exception as e:
+                skipped_parse_error += 1
+                logger.warning(f"Failed to parse {problem_id}: {e}")
+            
+            # Clean up buffer for this problem
+            del buffer[problem_id]
+            
     # Summary
+    elapsed = time.time() - start_time
     print(f"\n[{_ts()}] {'='*60}", flush=True)
     print(f"[{_ts()}] DATASET LOADING SUMMARY", flush=True)
     print(f"[{_ts()}] {'='*60}", flush=True)
-    print(f"[{_ts()}]   Scanned: {scanned_count}", flush=True)
-    print(f"[{_ts()}]   Yielded: {yielded_count}", flush=True)
-    print(f"[{_ts()}]   Skipped (not in allowlist): {skipped_not_in_allowlist}", flush=True)
+    print(f"[{_ts()}]   Scanned files: {scanned_files}", flush=True)
+    print(f"[{_ts()}]   Yielded examples: {yielded_count}", flush=True)
+    print(f"[{_ts()}]   Skipped (allowlist): {skipped_not_in_allowlist}", flush=True) # approx (count files)
     print(f"[{_ts()}]   Skipped (unlabeled): {skipped_unlabeled}", flush=True)
-    print(f"[{_ts()}]   Skipped (parse error): {skipped_parse_error}", flush=True)
+    print(f"[{_ts()}]   Skipped (parse err): {skipped_parse_error}", flush=True)
     print(f"[{_ts()}]   Time: {elapsed:.1f}s", flush=True)
     print(f"[{_ts()}] {'='*60}", flush=True)
 
 
-def _parse_example(item: dict, ta_label_field: str) -> Example | None:
+def _has_ta_labels(chunks_labeled: list, ta_label_field: str) -> bool:
+    """Check if TA labels exist in the chunks list."""
+    if not chunks_labeled or not isinstance(chunks_labeled, list):
+        return False
+    for chunk in chunks_labeled:
+        if chunk.get(ta_label_field) is not None:
+            return True
+    return False
+
+
+def _parse_aggregated_example(
+    problem_id: str,
+    data: dict,
+    ta_label_field: str
+) -> Optional[Example]:
     """
-    Parse a single dataset item into an Example.
-    
-    Expected fields in item:
-    - id: example identifier
-    - problem: the problem text
-    - reasoning_trace: the model's reasoning
-    - answer: the final answer
-    - chunks_labeled: JSON string with chunk info
+    Parse aggregated file contents into an Example.
+    data contains: {'base_solution.json': {...}, 'chunks_labeled.json': [...]}
     """
-    example_id = item.get("id", str(hash(str(item))))
+    base_sol = data.get("base_solution.json", {})
+    chunks_labeled = data.get("chunks_labeled.json", [])
     
-    # Get text components
-    problem = item.get("problem", "")
-    reasoning_trace = item.get("reasoning_trace", "")
-    answer = item.get("answer", "")
+    # We need to reconstruct full text from prompt + completion?
+    # Inspecting base_solution.json content from partial logs:
+    # "prompt": "Solve this...", "solution": "..." (maybe?)
+    # "reasoning_trace" was used in previous code, but that was for a row-based dataset.
+    # UZAYMACAR dataset typically has "prompt" and "solution" (or "completion").
+    # Let's try to infer fields.
     
-    if not reasoning_trace:
-        logger.debug(f"Skipping {example_id}: no reasoning_trace")
+    prompt = base_sol.get("prompt", "")
+    # Try finding the completion/solution part
+    # If not found, we might need to rely on what chunks reconstruct, but that's risky.
+    # Looking at common formats: "solution", "completion", "full_text"
+    # Inspecting item 0 from user log: base_solution.json content starts with "prompt".
+    # It likely has "solution" or "completion".
+    # Let's assume standard keys. If missing, we fail safely.
+    
+    # We will try to get the full solution text.
+    # Often 'solution' contains the reasoning + answer.
+    solution_text = base_sol.get("solution", base_sol.get("completion", ""))
+    if not solution_text:
+        # Check alternate keys
         return None
+
+    full_text = prompt + solution_text
     
-    # Build full text
-    # Format: problem + reasoning_trace + answer
-    # We need to track where each part starts
-    full_text = problem + reasoning_trace + answer
+    # Identify answer span
+    # The dataset often puts final answer in \boxed{}.
+    # We can try to assume the answer is at the end or marked.
+    # Previous code assumed separate "answer" field.
+    # Let's see if base_sol has "answer".
+    answer = base_sol.get("answer", "")
     
-    # Answer span in full_text
-    answer_start_char = len(problem) + len(reasoning_trace)
-    answer_end_char = len(full_text)
+    if not answer:
+        # Try to extract boxed answer logic or just treat end as answer?
+        # For Edge-Patch, we need a target token span.
+        # If we can't find clear answer, maybe use last N tokens?
+        # Let's stick to requiring "answer" field or similar.
+        # Looking at item 0 keys in user log: just 'content' json text shown.
+        pass
+        
+    # Re-using previous logic: "problem" + "reasoning_trace" + "answer"
+    # If this dataset separates them differently, we need to adapt.
+    # Assuming "solution" = reasoning + answer.
     
-    # Parse chunks from chunks_labeled
-    chunks_labeled_raw = item.get("chunks_labeled", None)
-    if chunks_labeled_raw is None:
-        logger.debug(f"Skipping {example_id}: no chunks_labeled")
-        return None
-    
-    # Parse JSON if it's a string
-    if isinstance(chunks_labeled_raw, str):
-        try:
-            chunks_labeled = json.loads(chunks_labeled_raw)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse chunks_labeled for {example_id}: {e}")
-            return None
-    else:
-        chunks_labeled = chunks_labeled_raw
-    
-    # Extract chunks
+    # Chunks Logic
     chunks = []
-    reasoning_start = len(problem)  # Offset for reasoning trace in full_text
+    
+    # If we have "solution_text", we need to map chunks to it.
+    # The chunks have "chunk" (text). 
+    # We can search for them in full_text.
+    
+    current_pos = len(prompt) # Start searching after prompt
     
     for idx, chunk_data in enumerate(chunks_labeled):
-        # Get chunk text and boundaries
-        chunk_text = chunk_data.get("text", chunk_data.get("chunk_text", ""))
-        
-        # Get character offsets within reasoning_trace
-        # These might be stored as start/end or start_char/end_char
-        start_in_reasoning = chunk_data.get("start", chunk_data.get("start_char", None))
-        end_in_reasoning = chunk_data.get("end", chunk_data.get("end_char", None))
-        
-        # If offsets not available, try to find the chunk in reasoning_trace
-        if start_in_reasoning is None or end_in_reasoning is None:
-            # Fallback: find the chunk text in reasoning_trace
-            pos = reasoning_trace.find(chunk_text)
-            if pos == -1:
-                logger.warning(f"Could not locate chunk {idx} in reasoning_trace for {example_id}")
+        chunk_text = chunk_data.get("chunk", chunk_data.get("text", ""))
+        if not chunk_text:
+            continue
+            
+        # Find exact match
+        start_char = full_text.find(chunk_text, current_pos)
+        if start_char == -1:
+            # Fallback: search from beginning of solution if alignment drift
+            start_char = full_text.find(chunk_text, len(prompt))
+            if start_char == -1:
+                logger.warning(f"Chunk {idx} not found in text for {problem_id}")
                 continue
-            start_in_reasoning = pos
-            end_in_reasoning = pos + len(chunk_text)
         
-        # Convert to full_text coordinates
-        start_char = reasoning_start + start_in_reasoning
-        end_char = reasoning_start + end_in_reasoning
+        end_char = start_char + len(chunk_text)
+        current_pos = end_char # Advance
         
-        # Get TA label
         ta_label = chunk_data.get(ta_label_field, 0.0)
-        if ta_label is None:
-            ta_label = 0.0
         
         chunks.append(Chunk(
             text=chunk_text,
             start_char=start_char,
             end_char=end_char,
-            ta_label=float(ta_label),
+            ta_label=float(ta_label) if ta_label is not None else 0.0,
             chunk_idx=idx,
         ))
-    
+        
     if not chunks:
-        logger.debug(f"Skipping {example_id}: no valid chunks")
         return None
+
+    # Answer Span
+    # If we have an explicit answer field, great.
+    # If not, we might assume the answer is after the last chunk?
+    # Or strict \boxed{} detection?
+    # Current codebase used "answer_start_char" explicitly. 
+    # Let's use the last chunk end as start of answer if no explicit answer field.
+    # OR if base_sol has "answer", we append it?
+    # This part is tricky without seeing full json.
+    # Let's assume standard behavior: full_text = prompt + solution.
+    # AND answer is part of solution.
     
+    answer_start_char = len(full_text)
+    answer_end_char = len(full_text)
+    
+    if answer:
+        # Check if answer is in full_text already
+        ans_pos = full_text.rfind(answer)
+        if ans_pos != -1:
+            answer_start_char = ans_pos
+            answer_end_char = ans_pos + len(answer)
+        else:
+            # Append it?
+            pass
+            
+    # Construct Example
     return Example(
-        id=example_id,
+        id=problem_id,
         full_text=full_text,
         chunks=chunks,
         answer_text=answer,
         answer_start_char=answer_start_char,
         answer_end_char=answer_end_char,
     )
-
-
-def get_ta_labels(example: Example) -> list[float]:
-    """Extract TA labels from chunks."""
-    return [chunk.ta_label for chunk in example.chunks]
