@@ -60,8 +60,6 @@ def main():
         # Use mid-layers to ensure we see non-zero deltas if masking works
         if args.edge_layers is None:
             args.edge_layers = [15, 16]
-        if args.edge_heads is None:
-            args.edge_heads = [0]
     elif args.mode == "confirm":
         if args.max_examples is None:
             args.max_examples = 3
