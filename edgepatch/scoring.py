@@ -320,9 +320,9 @@ def compute_chunk_scores(
             ) as masker:
                 masker.set_mask_positions(q_positions, k_positions)
                 
-                # Compute masked log-probability
+                # Compute masked log-probability (use same span as baseline!)
                 masked_logp = compute_answer_logp(
-                    model, input_ids, answer_span.start_token, answer_span.end_token
+                    model, input_ids, scoring_start, scoring_end
                 )
                 
                 # Get instrumentation

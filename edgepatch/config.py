@@ -113,8 +113,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
     # Mode
     parser.add_argument(
         "mode",
-        choices=["smoke", "confirm", "main"],
-        help="Run mode: smoke (1 example), confirm (3 examples), main (full)"
+        choices=["smoke", "confirm", "main", "nuclear"],
+        help="Run mode: smoke (1 example), confirm (3 examples), main (full), nuclear (ALL layers)"
     )
     
     # Config file
