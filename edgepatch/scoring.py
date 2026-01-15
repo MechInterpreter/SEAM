@@ -292,7 +292,7 @@ def compute_chunk_scores(
     heartbeat.update_progress(0, num_chunks)
     heartbeat.start()
     
-    scoring_start = time.time()
+    scoring_time_start = time.time()  # Don't shadow scoring_start (token index)!
     
     try:
         for chunk_idx, chunk_span in enumerate(chunk_spans):
@@ -359,7 +359,7 @@ def compute_chunk_scores(
     finally:
         heartbeat.stop()
     
-    scoring_elapsed = time.time() - scoring_start
+    scoring_elapsed = time.time() - scoring_time_start
     
     print(f"\n[{_ts()}] PHASE: Scoring complete", flush=True)
     print(f"[{_ts()}]   Total chunks scored: {len(scores)}", flush=True)
