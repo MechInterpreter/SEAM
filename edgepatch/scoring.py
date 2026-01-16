@@ -589,6 +589,7 @@ def compute_chunk_scores_rollout_light(
     decision_points, entropy_curve = discover_decision_points(
         model, input_ids, tokenizer,
         max_points=config.max_decision_points,
+        chunk_spans=chunk_spans,  # Pass chunk spans for proper DP placement
     )
     
     phase2_elapsed = time.time() - phase2_start
@@ -600,9 +601,9 @@ def compute_chunk_scores_rollout_light(
     print(f"\n[{_ts()}] PHASE 3: Heuristic chunk screening...", flush=True)
     top_l = min(15, num_chunks)
     
-    screen_chunks_by_heuristic(decision_points, chunk_spans, top_l=top_l)
+    heuristic_pairs = screen_chunks_by_heuristic(decision_points, chunk_spans, top_l=top_l)
     
-    print(f"[{_ts()}] PHASE 3: Complete | top-{top_l} chunks per decision point", flush=True)
+    print(f"[{_ts()}] PHASE 3: Complete | {heuristic_pairs} (chunk, dp) pairs for screening", flush=True)
     
     # ================================================================
     # PHASE 4: RECEIVER-SIDE MASKING SCREENING
@@ -727,6 +728,7 @@ def compute_chunk_scores_rollout_light(
             "rollout_k": config.rollout_k,
             "rollout_h": config.rollout_h,
             "top_l_screening": top_l,
+            "heuristic_pairs": heuristic_pairs,
         },
         "stats": {
             "decision_points_found": len(decision_points),
@@ -738,9 +740,34 @@ def compute_chunk_scores_rollout_light(
     
     print(f"\n[{_ts()}] ROLLOUT-LIGHT SCORING COMPLETE", flush=True)
     print(f"[{_ts()}]   decision_points_found: {len(decision_points)}", flush=True)
+    print(f"[{_ts()}]   heuristic_pairs: {heuristic_pairs}", flush=True)
     print(f"[{_ts()}]   chunks_screened: {total_screenings}", flush=True)
     print(f"[{_ts()}]   rollout_sets: {len(rollout_results)}", flush=True)
     print(f"[{_ts()}]   used_fallback: {used_fallback}", flush=True)
+    
+    # ================================================================
+    # FAIL-FAST VALIDATION
+    # ================================================================
+    if total_screenings == 0:
+        error_msg = (
+            f"ROLLOUT-LIGHT FAIL: chunks_screened=0. "
+            f"Decision points found: {len(decision_points)}, "
+            f"Heuristic pairs: {heuristic_pairs}, "
+            f"Num chunks: {num_chunks}. "
+            f"This indicates a bug in screening logic."
+        )
+        print(f"[{_ts()}] ERROR: {error_msg}", flush=True)
+        raise RuntimeError(error_msg)
+    
+    if len(rollout_results) == 0 and config.rollout_k > 0 and config.rollout_h > 0:
+        error_msg = (
+            f"ROLLOUT-LIGHT FAIL: rollout_sets=0 but rollouts were enabled. "
+            f"rollout_k={config.rollout_k}, rollout_h={config.rollout_h}, "
+            f"decision_points={len(decision_points)}. "
+            f"This indicates rollouts were skipped unexpectedly."
+        )
+        print(f"[{_ts()}] ERROR: {error_msg}", flush=True)
+        raise RuntimeError(error_msg)
     
     return scores, method_details
 

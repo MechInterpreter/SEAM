@@ -96,76 +96,27 @@ def find_local_minima(values: torch.Tensor, window: int = 5) -> list[int]:
     return minima
 
 
-def find_sentence_boundaries(
-    input_ids: torch.Tensor,
-    tokenizer,
-) -> list[int]:
-    """Find token indices that correspond to sentence boundaries."""
-    boundaries = []
-    
-    # Decode and find period/question/exclamation positions
-    text = tokenizer.decode(input_ids[0])
-    
-    # Get offset mapping if available
-    try:
-        encoding = tokenizer(text, return_offsets_mapping=True)
-        offset_mapping = encoding.offset_mapping
-    except:
-        return []
-    
-    for match in re.finditer(r'[.!?]\s+', text):
-        char_idx = match.end()
-        for idx, (start, end) in enumerate(offset_mapping):
-            if start <= char_idx < end:
-                boundaries.append(idx)
-                break
-    
-    return boundaries
-
-
-def find_answer_tokens(
-    input_ids: torch.Tensor,
-    tokenizer,
-) -> list[int]:
-    """Find token indices near 'Answer:' or boxed{} patterns."""
-    answer_tokens = []
-    text = tokenizer.decode(input_ids[0])
-    
-    patterns = [r'Answer:\s*', r'\\boxed\{', r'Therefore,?\s+the\s+answer']
-    
-    try:
-        encoding = tokenizer(text, return_offsets_mapping=True)
-        offset_mapping = encoding.offset_mapping
-    except:
-        return []
-    
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            char_idx = match.start()
-            for idx, (start, end) in enumerate(offset_mapping):
-                if start <= char_idx < end:
-                    answer_tokens.append(idx)
-                    break
-    
-    return answer_tokens
-
-
 def discover_decision_points(
     model,
     input_ids: torch.Tensor,
     tokenizer,
     max_points: int = 3,
+    chunk_spans: list = None,
 ) -> tuple[list[DecisionPoint], torch.Tensor]:
     """
     Discover decision points via entropy/margin analysis.
     
     NO attention extraction - just logits for entropy/margin curves.
     
+    Decision points are placed AFTER the earliest chunk ends to ensure
+    there are chunks that can influence them.
+    
     Args:
         model: The language model
         input_ids: Token IDs [1, seq_len]
         tokenizer: Tokenizer for pattern matching
         max_points: Maximum decision points to return
+        chunk_spans: Optional list of chunk spans to ensure DP placement after chunks
         
     Returns:
         decision_points: List of DecisionPoint objects
@@ -175,6 +126,17 @@ def discover_decision_points(
     seq_len = input_ids.shape[1]
     
     print(f"[{_ts()}] Decision point discovery (entropy/margin only, no attention)...", flush=True)
+    
+    # Determine minimum position for decision points
+    # Must be after at least one chunk ends to have something to screen
+    min_dp_pos = 50  # Default: at least 50 tokens in
+    if chunk_spans and len(chunk_spans) > 0:
+        # Find where the first few chunks end
+        first_chunk_ends = sorted([cs.end_token for cs in chunk_spans[:10]])
+        if first_chunk_ends:
+            min_dp_pos = max(min_dp_pos, first_chunk_ends[0] + 10)
+    
+    print(f"[{_ts()}] Min decision point position: {min_dp_pos}", flush=True)
     
     # Single forward pass - NO attention output (avoids O(n²) memory)
     with torch.no_grad():
@@ -194,16 +156,15 @@ def discover_decision_points(
     # Find candidate decision points
     entropy_maxima = set(find_local_maxima(entropy, window=10))
     margin_minima = set(find_local_minima(margin, window=10))
-    sentence_boundaries = set(find_sentence_boundaries(input_ids, tokenizer))
-    answer_tokens = set(find_answer_tokens(input_ids, tokenizer))
     
-    # Combine candidates
-    all_candidates = entropy_maxima | margin_minima | sentence_boundaries | answer_tokens
+    # Combine candidates, filtering by min position
+    all_candidates = entropy_maxima | margin_minima
     
     # Score and rank candidates by entropy
     candidate_scores = []
     for idx in all_candidates:
-        if idx >= len(entropy) or idx < 10:  # Skip edges
+        # Must be after min_dp_pos and not at the very end
+        if idx < min_dp_pos or idx >= seq_len - 10:
             continue
         candidate_scores.append((idx, entropy[idx].item()))
     
@@ -217,25 +178,27 @@ def discover_decision_points(
             token_idx=token_idx,
             entropy=ent,
             margin=margin[token_idx].item() if token_idx < len(margin) else 0.0,
-            is_sentence_boundary=(token_idx in sentence_boundaries),
-            is_answer_token=(token_idx in answer_tokens),
         )
         decision_points.append(dp)
     
-    # If no candidates found, use evenly-spaced fallback
+    # Fallback: if no candidates found, use evenly-spaced positions after min_dp_pos
     if not decision_points:
-        step = seq_len // (max_points + 1)
-        for i in range(1, max_points + 1):
-            idx = i * step
-            decision_points.append(DecisionPoint(
-                token_idx=idx,
-                entropy=entropy[idx].item() if idx < len(entropy) else 0.0,
-                margin=margin[idx].item() if idx < len(margin) else 0.0,
-            ))
+        print(f"[{_ts()}] No entropy peaks found, using evenly-spaced fallback", flush=True)
+        available_range = seq_len - min_dp_pos - 10
+        if available_range > 0:
+            step = available_range // (max_points + 1)
+            for i in range(1, max_points + 1):
+                idx = min_dp_pos + i * step
+                if idx < seq_len:
+                    decision_points.append(DecisionPoint(
+                        token_idx=idx,
+                        entropy=entropy[idx].item() if idx < len(entropy) else 0.0,
+                        margin=margin[idx].item() if idx < len(margin) else 0.0,
+                    ))
     
     print(f"[{_ts()}] Found {len(decision_points)} decision points:", flush=True)
     for dp in decision_points:
-        print(f"[{_ts()}]   Token {dp.token_idx}: entropy={dp.entropy:.3f}, margin={dp.margin:.3f}", flush=True)
+        print(f"[{_ts()}]   Token {dp.token_idx}: entropy={dp.entropy:.3f}", flush=True)
     
     return decision_points, entropy
 
@@ -244,13 +207,14 @@ def screen_chunks_by_heuristic(
     decision_points: list[DecisionPoint],
     chunk_spans: list,
     top_l: int = 15,
-) -> None:
+) -> int:
     """
     Screen chunks for each decision point using cheap heuristics.
     
     Heuristic: For each decision point, select:
     - Chunks in a recent window before the decision point
     - Plus some uniformly sampled earlier chunks
+    - Fallback: ALL chunks if nothing else works
     
     Updates decision_points in-place with top_chunks field.
     
@@ -258,41 +222,59 @@ def screen_chunks_by_heuristic(
         decision_points: List of DecisionPoint objects
         chunk_spans: List of TokenSpan objects
         top_l: Number of top chunks to keep per decision point
+        
+    Returns:
+        Total number of (chunk, dp) pairs selected
     """
-    if not chunk_spans:
-        return
+    if not chunk_spans or not decision_points:
+        print(f"[{_ts()}] WARNING: No chunks or decision points to screen", flush=True)
+        return 0
     
     num_chunks = len(chunk_spans)
+    total_selected = 0
     
     for dp in decision_points:
         token_idx = dp.token_idx
         
-        # Find chunks that end before this decision point
+        # Find chunks that START before this decision point (can influence it)
         prior_chunks = []
         for chunk_idx, chunk_span in enumerate(chunk_spans):
-            if chunk_span.end_token <= token_idx:
+            # A chunk can influence dp if it starts before dp
+            # (even if it doesn't fully end before dp)
+            if chunk_span.start_token < token_idx:
                 prior_chunks.append(chunk_idx)
         
+        print(f"[{_ts()}]   DP at token {token_idx}: {len(prior_chunks)} prior chunks", flush=True)
+        
         if not prior_chunks:
-            # Decision point is before all chunks - use first few chunks
+            # Decision point is before all chunks - use first L chunks as fallback
             dp.top_chunks = list(range(min(top_l, num_chunks)))
+            total_selected += len(dp.top_chunks)
+            print(f"[{_ts()}]   -> Using first {len(dp.top_chunks)} chunks (fallback)", flush=True)
             continue
         
         # Heuristic: recent window (last 10) + uniform samples from earlier
         recent_window = 10
-        recent_chunks = prior_chunks[-recent_window:]  # Last 10 chunks before dp
-        
-        # Add uniform samples from earlier chunks
-        earlier_chunks = prior_chunks[:-recent_window] if len(prior_chunks) > recent_window else []
-        if earlier_chunks:
-            # Sample up to (top_l - len(recent)) uniformly
-            n_samples = min(top_l - len(recent_chunks), len(earlier_chunks))
-            if n_samples > 0:
+        if len(prior_chunks) <= top_l:
+            # Use all prior chunks
+            selected_chunks = prior_chunks
+        else:
+            # Take last `recent_window` + uniform samples from the rest
+            recent_chunks = prior_chunks[-recent_window:]
+            earlier_chunks = prior_chunks[:-recent_window]
+            
+            # Sample uniformly from earlier
+            n_samples = top_l - len(recent_chunks)
+            if n_samples > 0 and earlier_chunks:
                 step = max(1, len(earlier_chunks) // n_samples)
                 sampled = earlier_chunks[::step][:n_samples]
-                recent_chunks = sampled + recent_chunks
+                selected_chunks = sampled + recent_chunks
+            else:
+                selected_chunks = recent_chunks
         
-        dp.top_chunks = recent_chunks[:top_l]
+        dp.top_chunks = selected_chunks[:top_l]
+        total_selected += len(dp.top_chunks)
+        print(f"[{_ts()}]   -> Selected {len(dp.top_chunks)} chunks", flush=True)
     
-    total_screened = sum(len(dp.top_chunks) for dp in decision_points)
-    print(f"[{_ts()}] Heuristic screening: selected {total_screened} (chunk, dp) pairs", flush=True)
+    print(f"[{_ts()}] Heuristic screening: {total_selected} total (chunk, dp) pairs", flush=True)
+    return total_selected
