@@ -1,8 +1,8 @@
 """
 Decision point discovery for rollout-light v2 scoring.
 
-Model-driven discovery via entropy/margin curves, not patterns.
-Attention-based screening for cheap chunk selection.
+Model-driven discovery via entropy/margin curves.
+NO full attention extraction - uses cheap heuristic screening.
 """
 
 from dataclasses import dataclass, field
@@ -30,7 +30,7 @@ class DecisionPoint:
     margin: float            # Top-1 vs Top-2 probability margin
     is_sentence_boundary: bool = False
     is_answer_token: bool = False
-    top_chunks: list[int] = field(default_factory=list)  # Top-L chunk indices by attention
+    top_chunks: list[int] = field(default_factory=list)  # Top-L chunk indices for screening
     
     def to_dict(self) -> dict:
         return {
@@ -111,12 +111,10 @@ def find_sentence_boundaries(
         encoding = tokenizer(text, return_offsets_mapping=True)
         offset_mapping = encoding.offset_mapping
     except:
-        # Fallback: approximate
         return []
     
     for match in re.finditer(r'[.!?]\s+', text):
         char_idx = match.end()
-        # Find corresponding token
         for idx, (start, end) in enumerate(offset_mapping):
             if start <= char_idx < end:
                 boundaries.append(idx)
@@ -157,75 +155,41 @@ def discover_decision_points(
     input_ids: torch.Tensor,
     tokenizer,
     max_points: int = 3,
-    return_attention: bool = True,
-) -> tuple[list[DecisionPoint], torch.Tensor, torch.Tensor]:
+) -> tuple[list[DecisionPoint], torch.Tensor]:
     """
     Discover decision points via entropy/margin analysis.
     
-    This runs ONE forward pass and extracts:
-    1. Entropy/margin curves for decision point selection
-    2. Attention weights for cheap chunk screening
+    NO attention extraction - just logits for entropy/margin curves.
     
     Args:
         model: The language model
         input_ids: Token IDs [1, seq_len]
         tokenizer: Tokenizer for pattern matching
         max_points: Maximum decision points to return
-        return_attention: Whether to return attention weights
         
     Returns:
         decision_points: List of DecisionPoint objects
         entropy: [seq_len] entropy values
-        attention_weights: [n_layers, n_heads, seq_len, seq_len] or None
     """
     device = input_ids.device
     seq_len = input_ids.shape[1]
     
-    # Single forward pass - try with attention, fallback without
-    attention_weights = None
-    logits = None
+    print(f"[{_ts()}] Decision point discovery (entropy/margin only, no attention)...", flush=True)
     
+    # Single forward pass - NO attention output (avoids O(n²) memory)
     with torch.no_grad():
-        # First try to get attention weights (may fail with 4-bit or OOM)
         try:
-            if return_attention:
-                outputs = model(
-                    input_ids,
-                    use_cache=False,
-                    output_attentions=True,
-                )
-                logits = outputs.logits[0]  # [seq_len, vocab]
-                attentions = outputs.attentions
-                # Stack attention weights
-                attention_weights = torch.stack([a[0] for a in attentions])  # [n_layers, n_heads, seq, seq]
-                print(f"[{_ts()}] Extracted attention weights: {attention_weights.shape}", flush=True)
-                del outputs, attentions  # Free memory
-            else:
-                raise ValueError("Attention not requested")
+            outputs = model(input_ids, use_cache=False, output_attentions=False)
+            logits = outputs.logits[0]  # [seq_len, vocab]
+            del outputs
         except torch.cuda.OutOfMemoryError as e:
-            # Clean up CUDA cache before retry
-            print(f"[{_ts()}] OOM during attention extraction, clearing cache...", flush=True)
+            print(f"[{_ts()}] FATAL: OOM even without attention output", flush=True)
             torch.cuda.empty_cache()
-            attention_weights = None
-            logits = None
-        except Exception as e:
-            print(f"[{_ts()}] Note: Could not extract attention weights ({e}), using fallback", flush=True)
-            attention_weights = None
-        
-        # Fallback: just get logits without attention
-        if logits is None:
-            try:
-                outputs = model(input_ids, use_cache=False)
-                logits = outputs.logits[0]
-                del outputs
-            except torch.cuda.OutOfMemoryError as e:
-                # Can't even do basic forward pass - re-raise
-                print(f"[{_ts()}] FATAL: OOM even without attention output", flush=True)
-                torch.cuda.empty_cache()
-                raise
+            raise
     
     # Compute entropy and margin curves
     entropy, margin = compute_entropy_and_margin_curves(logits)
+    del logits
     
     # Find candidate decision points
     entropy_maxima = set(find_local_maxima(entropy, window=10))
@@ -260,7 +224,6 @@ def discover_decision_points(
     
     # If no candidates found, use evenly-spaced fallback
     if not decision_points:
-        seq_len = input_ids.shape[1]
         step = seq_len // (max_points + 1)
         for i in range(1, max_points + 1):
             idx = i * step
@@ -270,71 +233,66 @@ def discover_decision_points(
                 margin=margin[idx].item() if idx < len(margin) else 0.0,
             ))
     
-    print(f"[{_ts()}] Decision point discovery: found {len(decision_points)} points", flush=True)
+    print(f"[{_ts()}] Found {len(decision_points)} decision points:", flush=True)
     for dp in decision_points:
         print(f"[{_ts()}]   Token {dp.token_idx}: entropy={dp.entropy:.3f}, margin={dp.margin:.3f}", flush=True)
     
-    return decision_points, entropy, attention_weights
+    return decision_points, entropy
 
 
-def screen_chunks_by_attention(
+def screen_chunks_by_heuristic(
     decision_points: list[DecisionPoint],
-    attention_weights: torch.Tensor,
     chunk_spans: list,
     top_l: int = 15,
 ) -> None:
     """
-    Screen chunks for each decision point using attention weights.
+    Screen chunks for each decision point using cheap heuristics.
     
-    This is FREE in terms of forward passes - just tensor operations.
+    Heuristic: For each decision point, select:
+    - Chunks in a recent window before the decision point
+    - Plus some uniformly sampled earlier chunks
     
     Updates decision_points in-place with top_chunks field.
     
     Args:
         decision_points: List of DecisionPoint objects
-        attention_weights: [n_layers, n_heads, seq_len, seq_len] attention weights
         chunk_spans: List of TokenSpan objects
         top_l: Number of top chunks to keep per decision point
     """
-    if attention_weights is None:
-        # Fallback: use all chunks
-        for dp in decision_points:
-            dp.top_chunks = list(range(min(top_l, len(chunk_spans))))
+    if not chunk_spans:
         return
     
-    # Average attention across layers and heads
-    # Shape: [seq_len, seq_len]
-    avg_attention = attention_weights.mean(dim=(0, 1))
+    num_chunks = len(chunk_spans)
     
     for dp in decision_points:
         token_idx = dp.token_idx
         
-        if token_idx >= avg_attention.shape[0]:
-            dp.top_chunks = list(range(min(top_l, len(chunk_spans))))
+        # Find chunks that end before this decision point
+        prior_chunks = []
+        for chunk_idx, chunk_span in enumerate(chunk_spans):
+            if chunk_span.end_token <= token_idx:
+                prior_chunks.append(chunk_idx)
+        
+        if not prior_chunks:
+            # Decision point is before all chunks - use first few chunks
+            dp.top_chunks = list(range(min(top_l, num_chunks)))
             continue
         
-        # Attention from this decision token to all prior tokens
-        attn_from_dp = avg_attention[token_idx, :token_idx]  # [token_idx]
+        # Heuristic: recent window (last 10) + uniform samples from earlier
+        recent_window = 10
+        recent_chunks = prior_chunks[-recent_window:]  # Last 10 chunks before dp
         
-        # Sum attention mass per chunk
-        chunk_scores = []
-        for chunk_idx, chunk_span in enumerate(chunk_spans):
-            # Only consider chunks before the decision point
-            if chunk_span.end_token > token_idx:
-                continue
-            
-            start = chunk_span.start_token
-            end = min(chunk_span.end_token, token_idx)
-            
-            if start < end and start < len(attn_from_dp):
-                chunk_attn = attn_from_dp[start:end].sum().item()
-            else:
-                chunk_attn = 0.0
-            
-            chunk_scores.append((chunk_idx, chunk_attn))
+        # Add uniform samples from earlier chunks
+        earlier_chunks = prior_chunks[:-recent_window] if len(prior_chunks) > recent_window else []
+        if earlier_chunks:
+            # Sample up to (top_l - len(recent)) uniformly
+            n_samples = min(top_l - len(recent_chunks), len(earlier_chunks))
+            if n_samples > 0:
+                step = max(1, len(earlier_chunks) // n_samples)
+                sampled = earlier_chunks[::step][:n_samples]
+                recent_chunks = sampled + recent_chunks
         
-        # Sort by attention and keep top-L
-        chunk_scores.sort(key=lambda x: x[1], reverse=True)
-        dp.top_chunks = [c[0] for c, _ in zip(chunk_scores, range(top_l))]
+        dp.top_chunks = recent_chunks[:top_l]
     
-    print(f"[{_ts()}] Attention screening: top-{top_l} chunks per decision point", flush=True)
+    total_screened = sum(len(dp.top_chunks) for dp in decision_points)
+    print(f"[{_ts()}] Heuristic screening: selected {total_screened} (chunk, dp) pairs", flush=True)

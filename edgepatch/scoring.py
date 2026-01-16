@@ -537,7 +537,7 @@ def compute_chunk_scores_rollout_light(
     
     Phases:
     1. Discover decision points via entropy/margin curves
-    2. Screen chunks by attention weights (FREE - no forward passes)
+    2. Screen chunks by heuristic (recent window + uniform samples)
     3. Receiver-side masking for top-L chunks per decision point
     4. Optional: Paired rollouts at top decision points
     
@@ -547,7 +547,7 @@ def compute_chunk_scores_rollout_light(
     """
     from edgepatch.decision_points import (
         discover_decision_points, 
-        screen_chunks_by_attention,
+        screen_chunks_by_heuristic,
     )
     from edgepatch.rollout import (
         run_screening_with_receiver_masking,
@@ -556,9 +556,10 @@ def compute_chunk_scores_rollout_light(
     
     device = next(model.parameters()).device
     num_chunks = len(chunk_spans)
+    used_fallback = False
     
     print(f"\n[{_ts()}] {'='*60}", flush=True)
-    print(f"[{_ts()}] ROLLOUT-LIGHT SCORING", flush=True)
+    print(f"[{_ts()}] ROLLOUT-LIGHT SCORING (no attention extraction)", flush=True)
     print(f"[{_ts()}] {'='*60}", flush=True)
     print(f"[{_ts()}]   Chunks: {num_chunks}", flush=True)
     print(f"[{_ts()}]   Max decision points: {config.max_decision_points}", flush=True)
@@ -580,27 +581,26 @@ def compute_chunk_scores_rollout_light(
     print(f"[{_ts()}] PHASE 1: Complete | seq_len={seq_len}", flush=True)
     
     # ================================================================
-    # PHASE 2: DECISION POINT DISCOVERY (1 forward pass with attention)
+    # PHASE 2: DECISION POINT DISCOVERY (entropy/margin only, no attention)
     # ================================================================
     print(f"\n[{_ts()}] PHASE 2: Decision point discovery...", flush=True)
     phase2_start = time.time()
     
-    decision_points, entropy_curve, attention_weights = discover_decision_points(
+    decision_points, entropy_curve = discover_decision_points(
         model, input_ids, tokenizer,
         max_points=config.max_decision_points,
-        return_attention=True,
     )
     
     phase2_elapsed = time.time() - phase2_start
     print(f"[{_ts()}] PHASE 2: Complete ({phase2_elapsed:.2f}s) | {len(decision_points)} decision points", flush=True)
     
     # ================================================================
-    # PHASE 3: ATTENTION-BASED SCREENING (FREE - no forward passes)
+    # PHASE 3: HEURISTIC CHUNK SCREENING (FREE - no forward passes)
     # ================================================================
-    print(f"\n[{_ts()}] PHASE 3: Attention-based chunk screening...", flush=True)
+    print(f"\n[{_ts()}] PHASE 3: Heuristic chunk screening...", flush=True)
     top_l = min(15, num_chunks)
     
-    screen_chunks_by_attention(decision_points, attention_weights, chunk_spans, top_l=top_l)
+    screen_chunks_by_heuristic(decision_points, chunk_spans, top_l=top_l)
     
     print(f"[{_ts()}] PHASE 3: Complete | top-{top_l} chunks per decision point", flush=True)
     
@@ -732,10 +732,15 @@ def compute_chunk_scores_rollout_light(
             "decision_points_found": len(decision_points),
             "chunks_screened": total_screenings,
             "rollout_sets": len(rollout_results),
+            "used_fallback": used_fallback,
         }
     }
     
     print(f"\n[{_ts()}] ROLLOUT-LIGHT SCORING COMPLETE", flush=True)
+    print(f"[{_ts()}]   decision_points_found: {len(decision_points)}", flush=True)
+    print(f"[{_ts()}]   chunks_screened: {total_screenings}", flush=True)
+    print(f"[{_ts()}]   rollout_sets: {len(rollout_results)}", flush=True)
+    print(f"[{_ts()}]   used_fallback: {used_fallback}", flush=True)
     
     return scores, method_details
 
