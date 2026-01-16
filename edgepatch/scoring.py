@@ -624,7 +624,7 @@ def compute_chunk_scores_rollout_light(
     for dp in decision_points:
         # Screen chunks at this decision point
         chunk_kl_scores = run_screening_with_receiver_masking(
-            model, input_ids, dp, chunk_spans, baseline_log_probs, config
+            model, input_ids, dp, chunk_spans, baseline_log_probs, config, model_info
         )
         
         for chunk_idx, kl in chunk_kl_scores:

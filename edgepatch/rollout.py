@@ -371,6 +371,7 @@ def run_screening_with_receiver_masking(
     chunk_spans: list,
     baseline_log_probs: torch.Tensor,
     config,
+    model_info: dict,  # Now passed from caller
 ) -> list[tuple[int, float]]:
     """
     Run receiver-side masking to screen chunks at a decision point.
@@ -384,6 +385,7 @@ def run_screening_with_receiver_masking(
         chunk_spans: List of TokenSpan objects
         baseline_log_probs: Baseline log-probs [seq_len, vocab]
         config: EdgePatchConfig
+        model_info: Dict with num_layers, num_heads, layer_to_module
         
     Returns:
         List of (chunk_idx, kl_score) sorted by KL
@@ -392,11 +394,6 @@ def run_screening_with_receiver_masking(
     
     device = input_ids.device
     dp_idx = decision_point.token_idx
-    
-    model_info = {
-        "num_layers": model.config.num_hidden_layers,
-        "num_heads": model.config.num_attention_heads,
-    }
     
     # Get baseline distribution at decision point
     if dp_idx > 0 and dp_idx - 1 < baseline_log_probs.shape[0]:
