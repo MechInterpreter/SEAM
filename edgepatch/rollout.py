@@ -36,6 +36,10 @@ class RolloutResult:
     """Result of running rollouts at a decision point for a chunk."""
     decision_point_idx: int
     chunk_idx: int
+    baseline_logp: float               # Teacher-forced log-prob of gold answer (baseline)
+    intervened_logp: float             # Teacher-forced log-prob of gold answer (intervened)
+    chunk_len: int                     # Length of chunk in tokens
+    masked_entries_count: int          # Number of KV entries masked
     baseline_reached_answer: bool
     intervened_reached_answer: bool
     answer_prob_shift: float           # |P(answer | base) - P(answer | inter)|
@@ -47,6 +51,10 @@ class RolloutResult:
         return {
             "decision_point_idx": self.decision_point_idx,
             "chunk_idx": self.chunk_idx,
+            "baseline_logp": round(self.baseline_logp, 4),
+            "intervened_logp": round(self.intervened_logp, 4),
+            "chunk_len": self.chunk_len,
+            "masked_entries_count": self.masked_entries_count,
             "answer_prob_shift": round(self.answer_prob_shift, 4),
             "answer_content_divergence": round(self.answer_content_divergence, 4),
             "baseline_reached_answer": self.baseline_reached_answer,
