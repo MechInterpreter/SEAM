@@ -647,6 +647,14 @@ def compute_chunk_scores_rollout_light(
         print(f"\n[{_ts()}] PHASE 5: Paired rollouts at decision points...", flush=True)
         phase5_start = time.time()
         
+
+        # Tokenize answer for scoring
+        answer_token_ids = []
+        if example.answer:
+            # We want the answer tokens without special tokens if possible, or consistent with generation
+            # Usually strict tokenization of answer string:
+            answer_token_ids = tokenizer.encode(example.answer, add_special_tokens=False)
+        
         # Rollouts only at top M decision points, for top T chunks
         rollout_budget = 0
         for dp in decision_points[:3]:  # Top 3 decision points
@@ -662,6 +670,7 @@ def compute_chunk_scores_rollout_light(
                     chunk_span_start=chunk_span.start_token,
                     chunk_span_end=chunk_span.end_token,
                     chunk_idx=chunk_idx,
+                    answer_token_ids=answer_token_ids,
                     rollout_k=config.rollout_k,
                     rollout_h=config.rollout_h,
                     temperature=config.rollout_temperature,
@@ -672,8 +681,9 @@ def compute_chunk_scores_rollout_light(
                 
                 # Log result
                 print(f"[{_ts()}]   dp={dp.token_idx}, chunk={chunk_idx}: "
-                      f"ans_shift={result.answer_prob_shift:.3f}, "
-                      f"content_div={result.answer_content_divergence:.3f}", flush=True)
+                      f"delta_logp={result.intervened_logp - result.baseline_logp:.4f}, "
+                      f"content_div={result.answer_content_divergence:.3f}, "
+                      f"masks={result.masked_entries_count}", flush=True)
         
         phase5_elapsed = time.time() - phase5_start
         print(f"[{_ts()}] PHASE 5: Complete ({phase5_elapsed:.2f}s) | {len(rollout_results)} rollout sets", flush=True)
@@ -685,38 +695,77 @@ def compute_chunk_scores_rollout_light(
     # ================================================================
     print(f"\n[{_ts()}] PHASE 6: Aggregating chunk scores...", flush=True)
     
-    # Incorporate rollout divergence into chunk scores
-    rollout_boosts = {i: 0.0 for i in range(num_chunks)}
+    # Aggregate rollout metrics per chunk
+    # A chunk might be evaluated at multiple decision points
+    chunk_metrics = {}  # chunk_idx -> list of results
+    
     for result in rollout_results:
-        # Higher answer_prob_shift or content_divergence = more important
-        boost = result.answer_prob_shift + result.answer_content_divergence
-        rollout_boosts[result.chunk_idx] += boost
+        if result.chunk_idx not in chunk_metrics:
+            chunk_metrics[result.chunk_idx] = []
+        chunk_metrics[result.chunk_idx].append(result)
     
     # Create ChunkScore objects
     scores = []
+    
+    # Define "all layers" mask spec for bookkeeping (since we look at KV cache which implies all layers)
+    all_layers_spec = [i for i in range(model.config.num_hidden_layers)]
+    
     for chunk_idx in range(num_chunks):
-        # Base score: average KL across decision points where this chunk was evaluated
-        if chunk_hit_counts[chunk_idx] > 0:
-            kl_score = chunk_kl_totals[chunk_idx] / chunk_hit_counts[chunk_idx]
-        else:
-            kl_score = 0.0
+        delta_logp = 0.0
+        abs_delta_logp = 0.0
+        baseline_logp = 0.0
+        masked_logp = 0.0
+        masked_entries_count = 0
+        layers_mask_applied = []
         
-        # Add rollout boost
-        final_score = kl_score + rollout_boosts[chunk_idx]
+        # If this chunk was rolled out, take average metrics
+        if chunk_idx in chunk_metrics:
+            results = chunk_metrics[chunk_idx]
+            n = len(results)
+            
+            # Average the metrics across decision points
+            avg_base = sum(r.baseline_logp for r in results) / n
+            avg_inter = sum(r.intervened_logp for r in results) / n
+            
+            baseline_logp = avg_base
+            masked_logp = avg_inter
+            delta_logp = avg_inter - avg_base
+            abs_delta_logp = abs(delta_logp)
+            
+            # For bookkeeping, max entries masked (conceptually) or sum?
+            # Usually we want to know "was it masked?". 
+            # We take the count from one instance (since they are same chunk span)
+            masked_entries_count = results[0].masked_entries_count
+            layers_mask_applied = all_layers_spec
+            
+            # Boost score with other signals like content divergence?
+            # User requirement: "scores[].delta_logp/abs_delta_logp reflect the aggregated signal"
+            # We can just rely on delta_logp from gold answer.
+            # But earlier code mixed in content_divergence.
+            # Let's keep delta_logp pure (log prob shift) as user requested "delta_logp = masked_logp - baseline_logp"
+            
+        else:
+            # Fallback for unscreened chunks? user earlier said "never 0/0 unless example is truly empty"
+            # If screening skipped it, score is 0.
+            pass
         
         scores.append(ChunkScore(
             chunk_idx=chunk_idx,
-            delta_logp=final_score,  # Using delta_logp field for compatibility
-            abs_delta_logp=final_score,
-            baseline_logp=0.0,  # Not applicable for rollout-light
-            masked_logp=0.0,
+            delta_logp=delta_logp,
+            abs_delta_logp=abs_delta_logp,
+            baseline_logp=baseline_logp,
+            masked_logp=masked_logp,
             ta_label=example.chunks[chunk_idx].ta_label,
-            layers_mask_applied=[],
-            heads_mask_applied={},
-            masked_entries_count=0,
+            layers_mask_applied=layers_mask_applied,
+            heads_mask_applied={}, # We don't track heads individually here (all heads ablated)
+            masked_entries_count=masked_entries_count,
         ))
     
     print(f"[{_ts()}] PHASE 6: Complete | {len(scores)} chunk scores", flush=True)
+    
+    # ================================================================
+    # METHOD DETAILS
+    # ================================================================
     
     # Build method details for artifact
     method_details = {
@@ -748,6 +797,19 @@ def compute_chunk_scores_rollout_light(
     # ================================================================
     # FAIL-FAST VALIDATION
     # ================================================================
+    if total_screenings == 0 and len(decision_points) > 0:
+        raise RuntimeError(f"FAIL: chunks_screened=0 but decision_points>0. Heuristic screening failed.")
+        
+    if len(rollout_results) == 0 and len(decision_points) > 0 and config.rollout_k > 0:
+        raise RuntimeError(f"FAIL: rollout_sets=0 but decision_points>0. Rollouts failed to run.")
+
+    # Validate mask bookkeeping for executed rollouts
+    for r in rollout_results:
+        if r.masked_entries_count == 0:
+             raise RuntimeError(f"FAIL: masked_entries_count=0 for processed rollout (chunk {r.chunk_idx}). Masking tracking bug.")
+        if r.first_token_kl > 1e-6 and r.masked_entries_count == 0:
+             raise RuntimeError(f"FAIL: Non-zero KL ({r.first_token_kl}) but masked_entries_count=0. Bookkeeping disjoint.")
+
     if total_screenings == 0:
         error_msg = (
             f"ROLLOUT-LIGHT FAIL: chunks_screened=0. "

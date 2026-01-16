@@ -177,6 +177,51 @@ def ablate_kv_for_span(
         return tuple(ablated)
 
 
+def compute_forcing_score(
+    model,
+    current_token: torch.Tensor,
+    past_key_values,
+    target_ids: torch.Tensor,
+) -> float:
+    """
+    Compute sum log-probability of target_ids given context.
+    Updates past_key_values in-place (or returns new if immutable, but DynamicCache is mutable).
+    """
+    device = current_token.device
+    total_logp = 0.0
+    
+    # We need to compute p(target[0] | context), p(target[1] | context + target[0]), etc.
+    # The first logit comes from the last step of generation (passed in via current_token/past_key_values?)
+    # Wait, simple loop:
+    
+    curr_input = current_token
+    curr_kv = past_key_values
+    
+    # However, to get the logits for the *next* token, we need to have run the model on `curr_input`.
+    # In generate_continuation_paired loop, we just ran the model on `current_token`.
+    # So we need the OUTPUT logits from that last run to score target_ids[0].
+    # But this helper is called *after* the loop. The loop discarded the last logits.
+    # So we must run one forward pass on `current_token` to get logits for target_ids[0].
+    
+    with torch.no_grad():
+        for i, target_id in enumerate(target_ids):
+            # Forward pass
+            outputs = model(curr_input, past_key_values=curr_kv, use_cache=True)
+            curr_kv = outputs.past_key_values
+            
+            # Score target token
+            # logits shape: [batch, 1, vocab]
+            logits = outputs.logits[:, -1, :]
+            log_probs = F.log_softmax(logits, dim=-1)
+            token_logp = log_probs[0, target_id].item()
+            total_logp += token_logp
+            
+            # Prepare next input
+            curr_input = target_ids[i:i+1].unsqueeze(0).to(device)
+            
+    return total_logp
+
+
 def generate_continuation_paired(
     model,
     tokenizer,
@@ -184,11 +229,15 @@ def generate_continuation_paired(
     baseline_kv: Any,
     intervened_kv: Any,
     horizon: int,
+    answer_ids: torch.Tensor = None,  # Gold answer tokens for scoring
     temperature: float = 0.7,
     seed: int = 42,
-) -> tuple[str, str, list[int], list[int], float]:
+) -> tuple[str, str, list[int], list[int], float, float, float]:
     """
-    Generate paired continuations with same RNG seed.
+    Generate paired continuations and score gold answer.
+    
+    Returns:
+        base_text, inter_text, base_tokens, inter_tokens, first_kl, base_logp, inter_logp
     """
     device = prefix_ids.device
     
@@ -224,7 +273,15 @@ def generate_continuation_paired(
             
             if next_token.item() == tokenizer.eos_token_id:
                 break
-    
+        
+        # Compute teacher-forced logp of answer
+        baseline_logp = 0.0
+        if answer_ids is not None and len(answer_ids) > 0:
+            # We need to start forcing from the END of the generation
+            # current_token is the last generated token
+            # current_kv contains context up to last generated token
+            baseline_logp = compute_forcing_score(model, current_token, current_kv, answer_ids)
+
     # Generate intervened with SAME seed
     torch.manual_seed(seed)
     intervened_tokens = []
@@ -253,6 +310,11 @@ def generate_continuation_paired(
             
             if next_token.item() == tokenizer.eos_token_id:
                 break
+
+        # Compute teacher-forced logp of answer
+        intervened_logp = 0.0
+        if answer_ids is not None and len(answer_ids) > 0:
+            intervened_logp = compute_forcing_score(model, current_token, current_kv, answer_ids)
     
     # Compute first-token KL divergence
     first_token_kl = 0.0
@@ -266,7 +328,7 @@ def generate_continuation_paired(
     baseline_text = tokenizer.decode(baseline_tokens, skip_special_tokens=True)
     intervened_text = tokenizer.decode(intervened_tokens, skip_special_tokens=True)
     
-    return baseline_text, intervened_text, baseline_tokens, intervened_tokens, first_token_kl
+    return baseline_text, intervened_text, baseline_tokens, intervened_tokens, first_token_kl, baseline_logp, intervened_logp
 
 
 def detect_answer(text: str) -> tuple[bool, Optional[str]]:
@@ -331,29 +393,13 @@ def run_paired_rollouts(
     chunk_span_start: int,
     chunk_span_end: int,
     chunk_idx: int,
+    answer_token_ids: list[int] = None,  # ID(s) of the gold answer
     rollout_k: int = 4,
     rollout_h: int = 64,
     temperature: float = 0.7,
 ) -> RolloutResult:
     """
-    Run K paired rollouts at a decision point with and without chunk ablation.
-    
-    Uses the same RNG seeds for baseline and intervened to enable fair comparison.
-    
-    Args:
-        model: The language model
-        tokenizer: Tokenizer
-        input_ids: Full input token IDs [1, seq_len]
-        decision_point_token_idx: Token index of decision point
-        chunk_span_start: Start of chunk to ablate
-        chunk_span_end: End of chunk to ablate
-        chunk_idx: Index of this chunk
-        rollout_k: Number of paired rollouts
-        rollout_h: Horizon (tokens) per rollout
-        temperature: Sampling temperature
-        
-    Returns:
-        RolloutResult with aggregated metrics
+    Run K paired rollouts and measure impact on answer likelihood.
     """
     # Get prefix KV cache up to decision point
     baseline_kv, prefix_ids = get_prefix_kv_cache(model, input_ids, decision_point_token_idx)
@@ -361,59 +407,93 @@ def run_paired_rollouts(
     # Create ablated version of KV cache
     ablated_kv = ablate_kv_for_span(baseline_kv, chunk_span_start, chunk_span_end)
     
+    # Prepare answer IDs tensor
+    answer_tensor = None
+    if answer_token_ids:
+        answer_tensor = torch.tensor(answer_token_ids, device=input_ids.device)
+    
     baseline_reached_count = 0
     intervened_reached_count = 0
     total_prob_shift = 0.0
     total_content_div = 0.0
     total_overlap = 0.0
     total_first_kl = 0.0
+    total_base_logp = 0.0
+    total_inter_logp = 0.0
     
     for k in range(rollout_k):
-        seed = 42 + k  # Different but reproducible seeds per rollout pair
+        seed = 42 + k
         
         # Generate paired continuations
-        base_text, inter_text, base_tokens, inter_tokens, first_kl = generate_continuation_paired(
+        (base_text, inter_text, base_tokens, inter_tokens, 
+         first_kl, base_lp, inter_lp) = generate_continuation_paired(
             model, tokenizer, prefix_ids,
             baseline_kv, ablated_kv,
-            horizon=rollout_h, temperature=temperature, seed=seed
+            horizon=rollout_h, temperature=temperature, seed=seed,
+            answer_ids=answer_tensor
         )
         
-        # Detect answers
+        total_base_logp += base_lp
+        total_inter_logp += inter_lp
+        total_first_kl += first_kl
+        
+        # Detect answers (legacy check)
         base_reached, base_answer = detect_answer(base_text)
         inter_reached, inter_answer = detect_answer(inter_text)
         
-        if base_reached:
-            baseline_reached_count += 1
-        if inter_reached:
-            intervened_reached_count += 1
+        if base_reached: baseline_reached_count += 1
+        if inter_reached: intervened_reached_count += 1
         
-        # Compute answer probability shift
+        # Answer probability shift (legacy binary)
+        # We now also have logp shift, but keep this for compat
         prob_shift, content_div = compute_answer_probability_shift(
             base_text, inter_text, base_reached, inter_reached, base_answer, inter_answer
         )
         total_prob_shift += prob_shift
-        total_content_div += content_div
-        total_first_kl += first_kl
         
-        # Token overlap (fallback metric)
+        # Enhanced content divergence:
+        # If standard divergence is 0 but first_token_kl is significant, use KL or overlap
+        if content_div == 0.0 and first_kl > 1e-4:
+            # Use overlap-based divergence
+            if base_tokens and inter_tokens:
+                base_set = set(base_tokens)
+                inter_set = set(inter_tokens)
+                overlap = len(base_set & inter_set) / len(base_set | inter_set) if (base_set or inter_set) else 1.0
+                content_div = 1.0 - overlap
+            else:
+                content_div = 0.0 # both empty
+                
+        total_content_div += content_div
+        
+        # Token overlap
         if base_tokens and inter_tokens:
             base_set = set(base_tokens)
             inter_set = set(inter_tokens)
-            if base_set or inter_set:
-                overlap = len(base_set & inter_set) / len(base_set | inter_set)
-            else:
-                overlap = 1.0
+            overlap = len(base_set & inter_set) / len(base_set | inter_set) if (base_set or inter_set) else 1.0
             total_overlap += overlap
         else:
             total_overlap += 1.0
+            
+    # Stats
+    avg_base_logp = total_base_logp / rollout_k
+    avg_inter_logp = total_inter_logp / rollout_k
     
-    # Aggregate across K rollouts
+    # Calculate mask size
+    num_layers = model.config.num_hidden_layers
+    num_heads = model.config.num_attention_heads
+    chunk_len = chunk_span_end - chunk_span_start
+    masked_entries = num_layers * num_heads * chunk_len
+    
     return RolloutResult(
         decision_point_idx=decision_point_token_idx,
         chunk_idx=chunk_idx,
+        baseline_logp=avg_base_logp,
+        intervened_logp=avg_inter_logp,
+        chunk_len=chunk_len,
+        masked_entries_count=masked_entries,
         baseline_reached_answer=(baseline_reached_count > rollout_k / 2),
         intervened_reached_answer=(intervened_reached_count > rollout_k / 2),
-        answer_prob_shift=total_prob_shift / rollout_k,
+        answer_prob_shift=abs(avg_inter_logp - avg_base_logp), # Redefined to be logp shift magnitude
         answer_content_divergence=total_content_div / rollout_k,
         token_overlap=total_overlap / rollout_k,
         first_token_kl=total_first_kl / rollout_k,
