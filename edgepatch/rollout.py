@@ -69,7 +69,7 @@ def get_prefix_kv_cache(
         up_to_position: Cache KV up to this position (exclusive)
         
     Returns:
-        past_key_values: Cached KV states
+        past_key_values: Cached KV states (DynamicCache or tuple)
         prefix_ids: Input IDs up to position
     """
     with torch.no_grad():
@@ -79,39 +79,64 @@ def get_prefix_kv_cache(
 
 
 def ablate_kv_for_span(
-    past_key_values: tuple,
+    past_key_values,
     span_start: int,
     span_end: int,
-) -> tuple:
+):
     """
     Zero out KV cache entries for a token span (KV ablation).
     
+    Works with both DynamicCache and legacy tuple formats.
+    
     Args:
-        past_key_values: Tuple of (key, value) tensors per layer
+        past_key_values: DynamicCache or tuple of (key, value) tensors per layer
         span_start: Start token index to ablate
         span_end: End token index to ablate (exclusive)
         
     Returns:
-        Modified past_key_values with ablated span
+        Modified past_key_values with ablated span (same type as input)
     """
-    ablated = []
-    for layer_kv in past_key_values:
-        key, value = layer_kv
-        # Key and Value shape: [batch, n_heads, seq_len, head_dim]
-        
-        # Create copies
-        key_ablated = key.clone()
-        value_ablated = value.clone()
-        
-        # Zero out the span
-        seq_len = key.shape[2]
-        if span_start < seq_len and span_end <= seq_len:
-            key_ablated[:, :, span_start:span_end, :] = 0.0
-            value_ablated[:, :, span_start:span_end, :] = 0.0
-        
-        ablated.append((key_ablated, value_ablated))
+    from transformers.cache_utils import DynamicCache
     
-    return tuple(ablated)
+    # Check if it's a DynamicCache
+    if hasattr(past_key_values, 'key_cache') and hasattr(past_key_values, 'value_cache'):
+        # DynamicCache - create a new one with ablated values
+        new_cache = DynamicCache()
+        
+        for layer_idx in range(len(past_key_values.key_cache)):
+            key = past_key_values.key_cache[layer_idx].clone()
+            value = past_key_values.value_cache[layer_idx].clone()
+            
+            # Key and Value shape: [batch, n_heads, seq_len, head_dim]
+            seq_len = key.shape[2]
+            if span_start < seq_len and span_end <= seq_len:
+                key[:, :, span_start:span_end, :] = 0.0
+                value[:, :, span_start:span_end, :] = 0.0
+            
+            # Add to new cache using the update method
+            new_cache.update(key, value, layer_idx)
+        
+        return new_cache
+    else:
+        # Legacy tuple format
+        ablated = []
+        for layer_kv in past_key_values:
+            key, value = layer_kv
+            # Key and Value shape: [batch, n_heads, seq_len, head_dim]
+            
+            # Create copies
+            key_ablated = key.clone()
+            value_ablated = value.clone()
+            
+            # Zero out the span
+            seq_len = key.shape[2]
+            if span_start < seq_len and span_end <= seq_len:
+                key_ablated[:, :, span_start:span_end, :] = 0.0
+                value_ablated[:, :, span_start:span_end, :] = 0.0
+            
+            ablated.append((key_ablated, value_ablated))
+        
+        return tuple(ablated)
 
 
 def generate_continuation_paired(
