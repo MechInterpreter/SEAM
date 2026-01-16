@@ -55,6 +55,34 @@ class RolloutResult:
         }
 
 
+
+def ensure_dynamic_cache(past_key_values):
+    """
+    Ensure KV cache is a DynamicCache object, converting from tuple if needed.
+    
+    Workaround for Llama models that crash with 'tuple object has no attribute get_seq_length'.
+    """
+    from transformers.cache_utils import DynamicCache
+    
+    # Already a cache object?
+    if hasattr(past_key_values, 'get_seq_length'):
+        return past_key_values
+        
+    # Check if it's a tuple (legacy format)
+    if isinstance(past_key_values, tuple):
+        try:
+            cache = DynamicCache()
+            for layer_idx, layer_kv in enumerate(past_key_values):
+                key, value = layer_kv
+                cache.update(key, value, layer_idx)
+            return cache
+        except Exception as e:
+            print(f"[{_ts()}] Warning: Failed to convert tuple to DynamicCache: {e}", flush=True)
+            return past_key_values
+            
+    return past_key_values
+
+
 def get_prefix_kv_cache(
     model,
     input_ids: torch.Tensor,
@@ -75,7 +103,9 @@ def get_prefix_kv_cache(
     with torch.no_grad():
         prefix_ids = input_ids[:, :up_to_position]
         outputs = model(prefix_ids, use_cache=True)
-        return outputs.past_key_values, prefix_ids
+        # Ensure we return a DynamicCache if possible, as Llama expects it
+        pkv = ensure_dynamic_cache(outputs.past_key_values)
+        return pkv, prefix_ids
 
 
 def ablate_kv_for_span(
