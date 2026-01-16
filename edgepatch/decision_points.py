@@ -180,15 +180,29 @@ def discover_decision_points(
     """
     device = input_ids.device
     
-    # Single forward pass with attention output
+    # Single forward pass - try with attention, fallback without
+    attention_weights = None
+    
     with torch.no_grad():
-        outputs = model(
-            input_ids,
-            use_cache=False,
-            output_attentions=return_attention,
-        )
-        logits = outputs.logits[0]  # [seq_len, vocab]
-        attentions = outputs.attentions if return_attention else None
+        # First try to get attention weights (may fail with 4-bit or OOM)
+        try:
+            if return_attention:
+                outputs = model(
+                    input_ids,
+                    use_cache=False,
+                    output_attentions=True,
+                )
+                logits = outputs.logits[0]  # [seq_len, vocab]
+                attentions = outputs.attentions
+                # Stack attention weights
+                attention_weights = torch.stack([a[0] for a in attentions])  # [n_layers, n_heads, seq, seq]
+                print(f"[{_ts()}] Extracted attention weights: {attention_weights.shape}", flush=True)
+            else:
+                raise ValueError("Attention not requested")
+        except Exception as e:
+            print(f"[{_ts()}] Note: Could not extract attention weights ({e}), using fallback screening", flush=True)
+            outputs = model(input_ids, use_cache=False)
+            logits = outputs.logits[0]
     
     # Compute entropy and margin curves
     entropy, margin = compute_entropy_and_margin_curves(logits)
@@ -235,13 +249,6 @@ def discover_decision_points(
                 entropy=entropy[idx].item() if idx < len(entropy) else 0.0,
                 margin=margin[idx].item() if idx < len(margin) else 0.0,
             ))
-    
-    # Stack attention weights if available
-    if attentions is not None:
-        # attentions is tuple of [batch, n_heads, seq_len, seq_len] per layer
-        attention_weights = torch.stack([a[0] for a in attentions])  # [n_layers, n_heads, seq, seq]
-    else:
-        attention_weights = None
     
     print(f"[{_ts()}] Decision point discovery: found {len(decision_points)} points", flush=True)
     for dp in decision_points:
