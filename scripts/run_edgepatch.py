@@ -16,6 +16,7 @@ import sys
 import os
 import time
 import json
+import torch
 from dataclasses import asdict
 from pathlib import Path
 from datetime import datetime
@@ -213,15 +214,30 @@ def main():
                 
                 if use_rollout_light:
                     print(f"[{_ts()}] Using rollout_light scoring method", flush=True)
-                    chunk_scores, method_details = compute_chunk_scores_rollout_light(
-                        model,
-                        tokenizer,
-                        example,
-                        chunk_spans,
-                        answer_span,
-                        model_info,
-                        config,
-                    )
+                    try:
+                        chunk_scores, method_details = compute_chunk_scores_rollout_light(
+                            model,
+                            tokenizer,
+                            example,
+                            chunk_spans,
+                            answer_span,
+                            model_info,
+                            config,
+                        )
+                    except torch.cuda.OutOfMemoryError as e:
+                        # Fall back to legacy on OOM
+                        print(f"[{_ts()}] OOM in rollout_light, falling back to legacy method", flush=True)
+                        torch.cuda.empty_cache()
+                        use_rollout_light = False
+                        chunk_scores = compute_chunk_scores(
+                            model,
+                            tokenizer,
+                            example,
+                            chunk_spans,
+                            answer_span,
+                            model_info,
+                            config,
+                        )
                 else:
                     print(f"[{_ts()}] Using legacy (KL) scoring method", flush=True)
                     chunk_scores = compute_chunk_scores(

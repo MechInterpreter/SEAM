@@ -179,9 +179,11 @@ def discover_decision_points(
         attention_weights: [n_layers, n_heads, seq_len, seq_len] or None
     """
     device = input_ids.device
+    seq_len = input_ids.shape[1]
     
     # Single forward pass - try with attention, fallback without
     attention_weights = None
+    logits = None
     
     with torch.no_grad():
         # First try to get attention weights (may fail with 4-bit or OOM)
@@ -197,12 +199,30 @@ def discover_decision_points(
                 # Stack attention weights
                 attention_weights = torch.stack([a[0] for a in attentions])  # [n_layers, n_heads, seq, seq]
                 print(f"[{_ts()}] Extracted attention weights: {attention_weights.shape}", flush=True)
+                del outputs, attentions  # Free memory
             else:
                 raise ValueError("Attention not requested")
+        except torch.cuda.OutOfMemoryError as e:
+            # Clean up CUDA cache before retry
+            print(f"[{_ts()}] OOM during attention extraction, clearing cache...", flush=True)
+            torch.cuda.empty_cache()
+            attention_weights = None
+            logits = None
         except Exception as e:
-            print(f"[{_ts()}] Note: Could not extract attention weights ({e}), using fallback screening", flush=True)
-            outputs = model(input_ids, use_cache=False)
-            logits = outputs.logits[0]
+            print(f"[{_ts()}] Note: Could not extract attention weights ({e}), using fallback", flush=True)
+            attention_weights = None
+        
+        # Fallback: just get logits without attention
+        if logits is None:
+            try:
+                outputs = model(input_ids, use_cache=False)
+                logits = outputs.logits[0]
+                del outputs
+            except torch.cuda.OutOfMemoryError as e:
+                # Can't even do basic forward pass - re-raise
+                print(f"[{_ts()}] FATAL: OOM even without attention output", flush=True)
+                torch.cuda.empty_cache()
+                raise
     
     # Compute entropy and margin curves
     entropy, margin = compute_entropy_and_margin_curves(logits)
