@@ -70,6 +70,8 @@ def ensure_dynamic_cache(past_key_values):
         
     # Check if it's a tuple (legacy format)
     if isinstance(past_key_values, tuple):
+        # Only try to convert if we really need to (i.e. if we suspect it's a Llama model context)
+        # But here we just always try if it looks like a standard KV tuple
         try:
             cache = DynamicCache()
             for layer_idx, layer_kv in enumerate(past_key_values):
@@ -77,6 +79,8 @@ def ensure_dynamic_cache(past_key_values):
                 cache.update(key, value, layer_idx)
             return cache
         except Exception as e:
+            # Only print warning once per run ideally, but here we just print
+            # to avoid spamming, we could use a global flag, but for debugging let's be verbose if it fails
             print(f"[{_ts()}] Warning: Failed to convert tuple to DynamicCache: {e}", flush=True)
             return past_key_values
             
@@ -128,6 +132,10 @@ def ablate_kv_for_span(
     """
     from transformers.cache_utils import DynamicCache
     
+    # Try to upgrade tuple to DynamicCache first, if possible
+    if isinstance(past_key_values, tuple):
+        past_key_values = ensure_dynamic_cache(past_key_values)
+
     # Check if it's a DynamicCache
     if hasattr(past_key_values, 'key_cache') and hasattr(past_key_values, 'value_cache'):
         # DynamicCache - create a new one with ablated values
@@ -148,7 +156,7 @@ def ablate_kv_for_span(
         
         return new_cache
     else:
-        # Legacy tuple format
+        # Legacy tuple format (fallback)
         ablated = []
         for layer_kv in past_key_values:
             key, value = layer_kv
@@ -181,21 +189,12 @@ def generate_continuation_paired(
 ) -> tuple[str, str, list[int], list[int], float]:
     """
     Generate paired continuations with same RNG seed.
-    
-    Args:
-        model: The language model
-        tokenizer: Tokenizer for decoding
-        prefix_ids: Token IDs of the prefix [1, prefix_len]
-        baseline_kv: KV cache for baseline
-        intervened_kv: KV cache for intervened run
-        horizon: Number of tokens to generate
-        temperature: Sampling temperature
-        seed: Random seed for reproducibility (same for both)
-        
-    Returns:
-        baseline_text, intervened_text, baseline_tokens, intervened_tokens, first_token_kl
     """
     device = prefix_ids.device
+    
+    # Ensure KV caches are compatible (DynamicCache) before starting
+    baseline_kv = ensure_dynamic_cache(baseline_kv)
+    intervened_kv = ensure_dynamic_cache(intervened_kv)
     
     # Generate baseline
     torch.manual_seed(seed)
@@ -206,6 +205,7 @@ def generate_continuation_paired(
     
     with torch.no_grad():
         for step in range(horizon):
+            # Pass current_kv, which is now guaranteed to be DynamicCache if possible
             outputs = model(current_token, past_key_values=current_kv, use_cache=True)
             logits = outputs.logits[:, -1, :]
             current_kv = outputs.past_key_values
@@ -228,7 +228,7 @@ def generate_continuation_paired(
     # Generate intervened with SAME seed
     torch.manual_seed(seed)
     intervened_tokens = []
-    current_kv = intervened_kv
+    current_kv = intervened_kv  # Uses the ensured intervened_kv
     current_token = prefix_ids[:, -1:]
     intervened_first_logits = None
     
@@ -240,6 +240,7 @@ def generate_continuation_paired(
             
             if step == 0:
                 intervened_first_logits = logits.clone()
+
             
             if temperature > 0:
                 probs = F.softmax(logits / temperature, dim=-1)
