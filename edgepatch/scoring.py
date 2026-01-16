@@ -650,10 +650,10 @@ def compute_chunk_scores_rollout_light(
 
         # Tokenize answer for scoring
         answer_token_ids = []
-        if example.answer:
+        if example.answer_text:
             # We want the answer tokens without special tokens if possible, or consistent with generation
             # Usually strict tokenization of answer string:
-            answer_token_ids = tokenizer.encode(example.answer, add_special_tokens=False)
+            answer_token_ids = tokenizer.encode(example.answer_text, add_special_tokens=False)
         
         # Rollouts only at top M decision points, for top T chunks
         rollout_budget = 0
